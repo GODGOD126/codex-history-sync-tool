@@ -1,37 +1,91 @@
 # Codex History Sync Tool
 
-这个目录是一个适合直接发布到 GitHub 的版本。
+一个用于恢复 Codex Desktop 本地历史对话显示的小工具。
 
-它保留了当前实际可用工具的原始结构和中文界面，只补了最基础的开源发布文件，
-比如 `LICENSE` 和 `.gitignore`，并把文档里的个人路径改成了通用写法。
+当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库，并把旧线程重新挂到当前正在使用的 `model_provider` 下面。
 
-这个工具用于把本机 Codex Desktop 已保存的本地线程历史，重新挂到当前
-`config.toml` 里正在使用的 `model_provider` 下面。
+## 这个工具能做什么
 
-## Files
+- 查看当前本机 Codex 历史线程属于哪些 provider
+- 一键把旧 provider 下的线程同步到当前 provider
+- 在同步前自动备份数据库
+- 从备份恢复数据库
+- 提供一个可直接点击的 Windows 图形界面
 
-- `sync_backend.py`: SQLite backup, status, sync, and restore logic.
-- `launch_ui.ps1`: Minimal WinForms desktop UI and shortcut installer.
+## 适用场景
 
-## Requirements
+- 你切换了不同 API
+- 你切换了不同 provider
+- 你切换了登录方式
+- 你确认本地历史文件还在，但 Codex Desktop 左侧历史列表变空了
 
-- Windows PowerShell 5.1 or newer
-- `py -3` available in PATH
-- Local Codex data in `%USERPROFILE%\.codex`
+## 不适用的场景
 
-## Typical usage
+- 云端账号之间的聊天记录互相同步
+- 本地历史文件已经被删除
+- 不同电脑之间迁移聊天记录
 
-- Launch the UI: run `launch_ui.ps1`
-- Create a desktop shortcut: run `launch_ui.ps1 -InstallShortcutOnly`
-- CLI status: `py -3 .\sync_backend.py --json status`
-- CLI sync: `py -3 .\sync_backend.py --json sync`
+## 运行环境
 
-## Backup behavior
+- Windows
+- PowerShell 5.1 或更高版本
+- 已安装 Python，并可通过 `py -3` 调用
+- 本机存在 Codex Desktop 本地数据目录，通常是 `%USERPROFILE%\\.codex`
 
-- Every sync creates a backup in `%USERPROFILE%\.codex\history_sync_backups`
-- Every restore creates a safety backup before replacing the live database
+## 快速使用
 
-## Notes
+### 图形界面
 
-- The tool only works when the local Codex history files still exist on this machine.
-- The safest flow is to close Codex Desktop before syncing or restoring.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1
+```
+
+### 创建桌面快捷方式
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -InstallShortcutOnly
+```
+
+### 查看当前状态
+
+```powershell
+py -3 .\sync_backend.py --json status
+```
+
+### 执行同步
+
+```powershell
+py -3 .\sync_backend.py --json sync
+```
+
+### 手动创建备份
+
+```powershell
+py -3 .\sync_backend.py --json backup
+```
+
+### 从最新备份恢复
+
+```powershell
+py -3 .\sync_backend.py --json restore
+```
+
+## 备份说明
+
+- 每次同步前都会自动创建一份备份
+- 每次恢复前也会先创建一份安全备份
+- 备份默认保存在 `%USERPROFILE%\\.codex\\history_sync_backups`
+
+## 使用建议
+
+- 最稳妥的做法是先关闭 Codex Desktop，再执行同步或恢复
+- 如果同步完成后历史列表没有立刻刷新，重开一次 Codex Desktop 即可
+
+## 项目文件
+
+- `sync_backend.py`：后端同步、备份、恢复逻辑
+- `launch_ui.ps1`：Windows 图形界面
+
+## 免责声明
+
+这个工具直接操作本机 Codex 的本地状态数据库。虽然已经做了自动备份，但仍建议你在使用前先理解它的作用，并自行确认本地数据目录状态。
