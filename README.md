@@ -2,13 +2,14 @@
 
 一个用于恢复 Codex Desktop 本地历史对话显示的小工具。
 
-当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库，并把旧线程重新挂到当前正在使用的 `model_provider` 下面。
+当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库、会话文件和侧边栏索引，并把旧线程重新挂到当前正在使用的 `model_provider` 下面。
 
 ## 这个工具能做什么
 
 - 查看当前本机 Codex 历史线程属于哪些 provider
-- 一键把旧 provider 下的线程同步到当前 provider
-- 在同步前自动备份数据库
+- 一键把旧 provider 下的线程、会话元数据和侧边栏索引同步到当前 provider
+- Codex Desktop 正在运行时也可以同步；如果本地数据库正在写入，工具会等待空闲后继续
+- 在同步前自动备份数据库、侧边栏索引和会话元数据
 - 从备份恢复数据库
 - 提供一个可直接点击的 Windows 图形界面
 
@@ -75,10 +76,12 @@ py -3 .\sync_backend.py --json restore
 - 每次同步前都会自动创建一份备份
 - 每次恢复前也会先创建一份安全备份
 - 备份默认保存在 `%USERPROFILE%\\.codex\\history_sync_backups`
+- 新版备份会同时保存 `session_index.jsonl` 和会话文件首行元数据，恢复时会一起还原
 
 ## 使用建议
 
-- 最稳妥的做法是先关闭 Codex Desktop，再执行同步或恢复
+- Codex Desktop 开着也可以同步；如果它正在生成回复或保存历史，工具可能会等待几秒
+- 恢复备份会覆盖当前状态，最稳妥的做法仍然是在恢复前暂停正在运行的 Codex 任务
 - 如果同步完成后历史列表没有立刻刷新，重开一次 Codex Desktop 即可
 
 ## 项目文件
