@@ -6,6 +6,8 @@ import re
 import sqlite3
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,7 @@ class SessionRecord:
     thread_id: str
     path: Path
     model_provider: str
+    model: str | None
 
 
 def resolve_paths(codex_home: str | None) -> Paths:
@@ -108,12 +111,13 @@ def parse_current_model(config_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+@contextmanager
 def connect_db(
     path: Path,
     readonly: bool = False,
     timeout_seconds: float = DEFAULT_DB_TIMEOUT_SECONDS,
     busy_timeout_ms: int | None = None,
-) -> sqlite3.Connection:
+) -> Iterator[sqlite3.Connection]:
     if busy_timeout_ms is None:
         busy_timeout_ms = max(1, int(timeout_seconds * 1000))
 
@@ -122,9 +126,12 @@ def connect_db(
     else:
         conn = sqlite3.connect(str(path), timeout=timeout_seconds)
 
-    conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        conn.row_factory = sqlite3.Row
+        yield conn
+    finally:
+        conn.close()
 
 
 def ensure_environment(paths: Paths) -> None:
@@ -134,8 +141,16 @@ def ensure_environment(paths: Paths) -> None:
         raise RuntimeError(f"Missing database file: {paths.db_path}")
 
 
+def get_thread_columns(conn: sqlite3.Connection) -> set[str]:
+    return {str(row["name"]) for row in conn.execute("PRAGMA table_info(threads)")}
+
+
 def counts_to_rows(counts: OrderedDict[str, int]) -> list[dict[str, object]]:
     return [{"provider": key, "count": value} for key, value in counts.items()]
+
+
+def model_counts_to_rows(counts: OrderedDict[str, int]) -> list[dict[str, object]]:
+    return [{"model": key, "count": value} for key, value in counts.items()]
 
 
 def ordered_counts(values: list[str]) -> OrderedDict[str, int]:
@@ -166,6 +181,67 @@ def query_provider_counts(conn: sqlite3.Connection) -> OrderedDict[str, int]:
     ):
         counts[str(provider or "(empty)")] = int(count)
     return counts
+
+
+def query_model_counts(conn: sqlite3.Connection) -> OrderedDict[str, int]:
+    counts = OrderedDict()
+    for model, count in conn.execute(
+        """
+        SELECT model, COUNT(*)
+        FROM threads
+        GROUP BY model
+        ORDER BY COUNT(*) DESC, model ASC
+        """
+    ):
+        counts[str(model or "(empty)")] = int(count)
+    return counts
+
+
+def query_provider_model_counts(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = []
+    for provider, model, count in conn.execute(
+        """
+        SELECT model_provider, model, COUNT(*)
+        FROM threads
+        GROUP BY model_provider, model
+        ORDER BY COUNT(*) DESC, model_provider ASC, model ASC
+        """
+    ):
+        rows.append(
+            {
+                "provider": str(provider or "(empty)"),
+                "model": str(model or "(empty)"),
+                "count": int(count),
+            }
+        )
+    return rows
+
+
+def query_cwd_counts(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, object]]:
+    rows = []
+    for cwd, count in conn.execute(
+        """
+        SELECT cwd, COUNT(*)
+        FROM threads
+        GROUP BY cwd
+        ORDER BY COUNT(*) DESC, cwd ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ):
+        rows.append({"cwd": str(cwd or "(empty)"), "count": int(count)})
+    return rows
+
+
+def count_mismatched(conn: sqlite3.Connection, column: str, expected: str | None) -> int | None:
+    if expected is None:
+        return None
+    return int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM threads WHERE {column} IS NULL OR {column} <> ?",
+            (expected,),
+        ).fetchone()[0]
+    )
 
 
 def list_backups(paths: Paths, limit: int = 20) -> list[dict[str, str]]:
@@ -245,7 +321,9 @@ def parse_session_record(path: Path) -> SessionRecord | None:
         return None
 
     model_provider = str(payload.get("model_provider") or "")
-    return SessionRecord(thread_id=thread_id, path=path, model_provider=model_provider)
+    raw_model = payload.get("model")
+    model = str(raw_model) if raw_model else None
+    return SessionRecord(thread_id=thread_id, path=path, model_provider=model_provider, model=model)
 
 
 def scan_session_records(paths: Paths) -> list[SessionRecord]:
@@ -354,12 +432,19 @@ def restore_metadata(paths: Paths, backup_path: Path) -> dict[str, object]:
 def rebuild_session_index(paths: Paths, conn: sqlite3.Connection) -> dict[str, int]:
     started_at = time.monotonic()
     existing_entries = read_session_index(paths)
+    columns = get_thread_columns(conn)
+    select_parts = ["id"]
+    if "title" in columns:
+        select_parts.append("title")
+    if "updated_at" in columns:
+        select_parts.append("updated_at")
+    where_sql = "WHERE archived = 0" if "archived" in columns else ""
     db_rows = conn.execute(
-        """
-        SELECT id, title, updated_at
+        f"""
+        SELECT {", ".join(select_parts)}
         FROM threads
-        WHERE archived = 0
-        ORDER BY updated_at ASC, id ASC
+        {where_sql}
+        ORDER BY id ASC
         """
     ).fetchall()
     db_ids = {str(row["id"]) for row in db_rows}
@@ -369,15 +454,13 @@ def rebuild_session_index(paths: Paths, conn: sqlite3.Connection) -> dict[str, i
     for row in db_rows:
         thread_id = str(row["id"])
         existing_entry = existing_entries.get(thread_id)
+        title = str(row["title"]) if "title" in columns and row["title"] else thread_id
+        updated_at = int(row["updated_at"]) if "updated_at" in columns and row["updated_at"] else 0
         merged.append(
             {
                 "id": thread_id,
-                "thread_name": str(
-                    (existing_entry or {}).get("thread_name")
-                    or row["title"]
-                    or thread_id
-                ),
-                "updated_at": iso_utc_from_unix(int(row["updated_at"])),
+                "thread_name": str((existing_entry or {}).get("thread_name") or title),
+                "updated_at": iso_utc_from_unix(updated_at),
             }
         )
 
@@ -396,13 +479,14 @@ def rebuild_session_index(paths: Paths, conn: sqlite3.Connection) -> dict[str, i
     }
 
 
-def sync_session_records(paths: Paths, current_provider: str) -> dict[str, object]:
+def sync_session_records(paths: Paths, current_provider: str, current_model: str | None) -> dict[str, object]:
     started_at = time.monotonic()
     before_records = scan_session_records(paths)
     updated_session_files = 0
 
     for record in before_records:
-        if record.model_provider == current_provider:
+        model_matches = current_model is None or record.model == current_model
+        if record.model_provider == current_provider and model_matches:
             continue
 
         text = read_text_exact(record.path)
@@ -413,6 +497,8 @@ def sync_session_records(paths: Paths, current_provider: str) -> dict[str, objec
             continue
 
         payload["model_provider"] = current_provider
+        if current_model:
+            payload["model"] = current_model
         new_first_line = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
         if ending:
             new_text = new_first_line + ending + remainder
@@ -429,6 +515,12 @@ def sync_session_records(paths: Paths, current_provider: str) -> dict[str, objec
         ),
         "session_after_counts": counts_to_rows(
             ordered_counts([record.model_provider for record in after_records])
+        ),
+        "session_before_model_counts": model_counts_to_rows(
+            ordered_counts([record.model or "(empty)" for record in before_records])
+        ),
+        "session_after_model_counts": model_counts_to_rows(
+            ordered_counts([record.model or "(empty)" for record in after_records])
         ),
         "duration_ms": elapsed_ms(started_at),
     }
@@ -449,7 +541,11 @@ def checkpoint(conn: sqlite3.Connection, mode: str = SYNC_CHECKPOINT_MODE) -> tu
     return int(row[0]), int(row[1]), int(row[2])
 
 
-def update_provider_assignments(paths: Paths, current_provider: str) -> dict[str, object]:
+def update_provider_assignments(
+    paths: Paths,
+    current_provider: str,
+    current_model: str | None,
+) -> dict[str, object]:
     started_at = time.monotonic()
     last_error: sqlite3.OperationalError | None = None
 
@@ -462,21 +558,42 @@ def update_provider_assignments(paths: Paths, current_provider: str) -> dict[str
             ) as conn:
                 # 显式拿写锁，把等待控制在我们自己的重试节奏里。
                 conn.execute("BEGIN IMMEDIATE")
+                columns = get_thread_columns(conn)
                 before_counts = query_provider_counts(conn)
+                before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+                set_parts = ["model_provider = ?"]
+                set_params = [current_provider]
+                where_parts = ["model_provider IS NULL OR model_provider <> ?"]
+                where_params = [current_provider]
+                synced_fields = ["model_provider"]
+
+                if "model" in columns and current_model:
+                    set_parts.append("model = ?")
+                    set_params.append(current_model)
+                    where_parts.append("model IS NULL OR model <> ?")
+                    where_params.append(current_model)
+                    synced_fields.append("model")
+
+                set_sql = ", ".join(set_parts)
+                where_sql = " OR ".join(f"({part})" for part in where_parts)
                 updated_rows = conn.execute(
-                    "UPDATE threads SET model_provider = ? WHERE model_provider <> ?",
-                    (current_provider, current_provider),
+                    f"UPDATE threads SET {set_sql} WHERE {where_sql}",
+                    (*set_params, *where_params),
                 ).rowcount
                 conn.commit()
                 after_counts = query_provider_counts(conn)
+                after_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
                 checkpoint_result = checkpoint(conn)
 
             return {
                 "attempts": attempt,
                 "lock_wait_ms": elapsed_ms(started_at),
+                "synced_fields": synced_fields,
                 "updated_rows": updated_rows,
                 "before_counts": counts_to_rows(before_counts),
                 "after_counts": counts_to_rows(after_counts),
+                "before_model_counts": model_counts_to_rows(before_model_counts),
+                "after_model_counts": model_counts_to_rows(after_model_counts),
                 "checkpoint": {
                     "mode": SYNC_CHECKPOINT_MODE,
                     "busy": checkpoint_result[0],
@@ -549,20 +666,35 @@ def get_status(paths: Paths) -> dict[str, object]:
     current_model = parse_current_model(config_text)
     session_records = scan_session_records(paths)
     session_provider_counts = ordered_counts([record.model_provider for record in session_records])
+    session_model_counts = ordered_counts([record.model or "(empty)" for record in session_records])
     session_movable_ids = {
-        record.thread_id for record in session_records if record.model_provider != current_provider
+        record.thread_id
+        for record in session_records
+        if record.model_provider != current_provider
+        or (current_model is not None and record.model != current_model)
     }
+    should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
     index_entries = read_session_index(paths)
 
     with connect_db(paths.db_path, readonly=True) as conn:
+        columns = get_thread_columns(conn)
         counts = query_provider_counts(conn)
+        model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+        provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
+        cwd_counts = query_cwd_counts(conn) if "cwd" in columns else []
         total_threads = int(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
-        db_movable_ids = {
-            str(row["id"])
-            for row in conn.execute("SELECT id FROM threads WHERE model_provider <> ?", (current_provider,))
-        }
-        db_thread_ids = {str(row["id"]) for row in conn.execute("SELECT id FROM threads")}
-        missing_index_ids = db_thread_ids - set(index_entries)
+        provider_movable = count_mismatched(conn, "model_provider", current_provider)
+        model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
+        where_parts = ["model_provider IS NULL OR model_provider <> ?"]
+        params: list[str] = [current_provider]
+        if "model" in columns and current_model:
+            where_parts.append("model IS NULL OR model <> ?")
+            params.append(current_model)
+        where_sql = " OR ".join(f"({part})" for part in where_parts)
+        db_movable_ids = {str(row["id"]) for row in conn.execute(f"SELECT id FROM threads WHERE {where_sql}", params)}
+        db_thread_query = "SELECT id FROM threads WHERE archived = 0" if "archived" in columns else "SELECT id FROM threads"
+        db_thread_ids = {str(row["id"]) for row in conn.execute(db_thread_query)}
+        missing_index_ids = db_thread_ids - set(index_entries) if should_check_index else set()
         sync_candidate_ids = db_movable_ids | session_movable_ids | missing_index_ids
 
     return {
@@ -576,19 +708,24 @@ def get_status(paths: Paths) -> dict[str, object]:
         "current_model": current_model,
         "total_threads": total_threads,
         "movable_threads": len(sync_candidate_ids),
+        "provider_movable_threads": provider_movable,
+        "model_movable_threads": model_movable,
         "movable_database_threads": len(db_movable_ids),
         "movable_session_threads": len(session_movable_ids),
         "missing_session_index_entries": len(missing_index_ids),
         "indexed_threads": len(index_entries),
         "session_file_count": len(session_records),
         "provider_counts": counts_to_rows(counts),
+        "model_counts": model_counts_to_rows(model_counts),
+        "provider_model_counts": provider_model_counts,
+        "cwd_counts": cwd_counts,
         "session_provider_counts": counts_to_rows(session_provider_counts),
+        "session_model_counts": model_counts_to_rows(session_model_counts),
         "backups": list_backups(paths),
     }
 
 
 def make_backup(paths: Paths, label: str) -> Path:
-    started_at = time.monotonic()
     ensure_environment(paths)
     paths.backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -604,13 +741,15 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
     total_started_at = time.monotonic()
     status_before = get_status(paths)
     current_provider = str(status_before["current_provider"])
+    raw_current_model = status_before.get("current_model")
+    current_model = str(raw_current_model) if raw_current_model else None
 
     backup_started_at = time.monotonic()
     backup_path = make_backup(paths, "pre-sync")
     backup_duration_ms = elapsed_ms(backup_started_at)
 
-    db_summary = update_provider_assignments(paths, current_provider)
-    session_summary = sync_session_records(paths, current_provider)
+    db_summary = update_provider_assignments(paths, current_provider, current_model)
+    session_summary = sync_session_records(paths, current_provider, current_model)
 
     with connect_db(paths.db_path, readonly=True) as conn:
         index_summary = rebuild_session_index(paths, conn)
@@ -619,13 +758,21 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
     return {
         "action": "sync",
         "current_provider": current_provider,
+        "current_model": current_model,
+        "synced_fields": db_summary["synced_fields"],
         "updated_rows": db_summary["updated_rows"],
         "updated_session_files": session_summary["updated_session_files"],
+        "provider_movable_threads": status_before["provider_movable_threads"],
+        "model_movable_threads": status_before["model_movable_threads"],
         "backup_path": str(backup_path),
         "before_counts": db_summary["before_counts"],
         "after_counts": db_summary["after_counts"],
+        "before_model_counts": db_summary["before_model_counts"],
+        "after_model_counts": db_summary["after_model_counts"],
         "session_before_counts": session_summary["session_before_counts"],
         "session_after_counts": session_summary["session_after_counts"],
+        "session_before_model_counts": session_summary["session_before_model_counts"],
+        "session_after_model_counts": session_summary["session_after_model_counts"],
         "checkpoint": db_summary["checkpoint"],
         "lock_wait_ms": db_summary["lock_wait_ms"],
         "lock_attempts": db_summary["attempts"],

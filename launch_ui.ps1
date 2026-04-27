@@ -93,6 +93,16 @@ function Format-Counts {
   return (($Counts | ForEach-Object { "$($_.provider)=$($_.count)" }) -join ', ')
 }
 
+function Format-ModelCounts {
+  param($Counts)
+
+  if (-not $Counts -or $Counts.Count -eq 0) {
+    return '无'
+  }
+
+  return (($Counts | ForEach-Object { "$($_.model)=$($_.count)" }) -join ', ')
+}
+
 function Format-Duration {
   param($Milliseconds)
 
@@ -145,6 +155,9 @@ function Get-FriendlyStatus {
   if ([int]$Status.movable_database_threads -gt 0) {
     $parts += "$($Status.movable_database_threads) 条数据库记录待迁移"
   }
+  if ($null -ne $Status.model_movable_threads -and [int]$Status.model_movable_threads -gt 0) {
+    $parts += "$($Status.model_movable_threads) 条模型归属待修正"
+  }
   if ([int]$Status.movable_session_threads -gt 0) {
     $parts += "$($Status.movable_session_threads) 个会话文件待修正"
   }
@@ -166,9 +179,9 @@ function Apply-State {
   $script:LatestState = $Status
 
   $providerLabel.Text = "当前账号/Provider: $($Status.current_provider)"
-  $modelLabel.Text = if ($Status.current_model) { "当前模型: $($Status.current_model)" } else { '当前模型: 未读取到' }
+  $modelLabel.Text = if ($Status.current_model) { "当前模型: $($Status.current_model)    待修正: $($Status.model_movable_threads)" } else { '当前模型: 未读取到' }
   $summaryLabel.Text = "历史线程: $($Status.total_threads)    会话文件: $($Status.session_file_count)    侧边栏索引: $($Status.indexed_threads)"
-  $repairLabel.Text = "待修复: $($Status.movable_threads)    数据库: $($Status.movable_database_threads)    会话文件: $($Status.movable_session_threads)    索引: $($Status.missing_session_index_entries)"
+  $repairLabel.Text = "待修复: $($Status.movable_threads)    数据库: $($Status.movable_database_threads)    模型: $($Status.model_movable_threads)    会话文件: $($Status.movable_session_threads)    索引: $($Status.missing_session_index_entries)"
   $pathLabel.Text = "数据位置: $($Status.codex_home)"
   $statusLabel.Text = Get-FriendlyStatus $Status
 
@@ -386,7 +399,7 @@ $syncButton.Add_Click({
       Append-Log '同步跳过：当前已经没有需要修复的历史。'
       return
     }
-    $message = "将把旧账号/Provider 下的本地历史挂回当前账号：`r`n$($script:LatestState.current_provider)`r`n`r`n本次预计处理：$($script:LatestState.movable_threads) 项`r`n包含数据库记录、会话文件和侧边栏索引。`r`n`r`n工具会先自动备份。Codex 正在运行也可以，但如果它正在写入历史，可能会等待几秒。"
+    $message = "将把旧账号/Provider/模型下的本地历史挂回当前设置：`r`nProvider: $($script:LatestState.current_provider)`r`n模型: $($script:LatestState.current_model)`r`n`r`n本次预计处理：$($script:LatestState.movable_threads) 项`r`n包含数据库记录、会话文件和侧边栏索引。`r`n`r`n工具会先自动备份。Codex 正在运行也可以，但如果它正在写入历史，可能会等待几秒。"
     if (-not (Confirm-Action -Message $message -Title '开始找回历史？')) {
       Append-Log '用户取消了同步。'
       return
@@ -398,6 +411,8 @@ $syncButton.Add_Click({
     Append-Log "等待数据库空闲: $(Format-Duration $result.lock_wait_ms)，总耗时: $(Format-Duration $result.timing.total_ms)。"
     Append-Log "数据库同步前: $(Format-Counts $result.before_counts)"
     Append-Log "数据库同步后: $(Format-Counts $result.after_counts)"
+    Append-Log "模型同步前: $(Format-ModelCounts $result.before_model_counts)"
+    Append-Log "模型同步后: $(Format-ModelCounts $result.after_model_counts)"
     Append-Log "会话文件同步前: $(Format-Counts $result.session_before_counts)"
     Append-Log "会话文件同步后: $(Format-Counts $result.session_after_counts)"
     Append-Log "侧边栏索引已重建: $($result.rewritten_index_entries) 条，补回 $($result.missing_session_index_entries_before) 条。"
