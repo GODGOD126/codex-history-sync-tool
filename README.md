@@ -13,6 +13,7 @@
 - 在同步前自动备份数据库、侧边栏索引和会话元数据
 - 从备份恢复数据库
 - 提供一个可直接点击的 Windows 图形界面
+- 提供一个 SwiftUI 原生 macOS 图形界面
 
 ## 适用场景
 
@@ -30,12 +31,41 @@
 
 ## 运行环境
 
+### Windows
+
 - Windows
 - PowerShell 5.1 或更高版本
 - 已安装 Python 3.10 或更高版本，并可通过 `py -3` 调用
 - 本机存在 Codex Desktop 本地数据目录，通常是 `%USERPROFILE%\\.codex`
 
+### macOS
+
+- macOS 13 或更高版本
+- Xcode / Command Line Tools，能运行 `swift build`
+- 本机存在 Codex Desktop 本地数据目录，通常是 `~/.codex`
+
 ## 快速使用
+
+### macOS 图形界面
+
+```bash
+cd macos/CodexHistorySync
+./build_app.sh
+open ".build/app/Codex 历史找回助手.app"
+```
+
+这个 `.app` 默认未签名，适合本机自用验证。如果 macOS 提示无法打开，可以在 Finder 中右键选择“打开”，或按本机安全设置允许打开。
+
+macOS 版是 SwiftUI 原生应用，核心同步逻辑用 Swift 实现，不依赖 Python。它会读取 `~/.codex/config.toml`、操作 `~/.codex/state_5.sqlite`、扫描 `~/.codex/sessions`，并维护 `~/.codex/session_index.jsonl`。
+
+### macOS 运行测试
+
+```bash
+cd macos/CodexHistorySync
+swift test
+```
+
+### Windows 图形界面
 
 ### 图形界面
 
@@ -84,6 +114,7 @@ py -3 -m unittest discover -s tests -v
 - 每次同步前都会自动创建一份备份
 - 每次恢复前也会先创建一份安全备份
 - 备份默认保存在 `%USERPROFILE%\\.codex\\history_sync_backups`
+- macOS 备份默认保存在 `~/.codex/history_sync_backups`
 - 新版备份会同时保存 `session_index.jsonl` 和会话文件首行元数据，恢复时会一起还原
 
 ## 使用建议
@@ -97,6 +128,7 @@ py -3 -m unittest discover -s tests -v
 
 - `sync_backend.py`：后端同步、备份、恢复逻辑
 - `launch_ui.ps1`：Windows 图形界面
+- `macos/CodexHistorySync`：SwiftUI 原生 macOS 应用和 Swift 核心同步逻辑
 
 ## 免责声明
 

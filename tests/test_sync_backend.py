@@ -16,6 +16,13 @@ def write_config(codex_home, provider: str = "new_provider", model: str = "gpt-n
     )
 
 
+def write_config_without_provider(codex_home, model: str = "gpt-new") -> None:
+    (codex_home / "config.toml").write_text(
+        f'model = "{model}"\n',
+        encoding="utf-8",
+    )
+
+
 def create_threads_db(codex_home, *, with_model: bool = True) -> None:
     conn = sqlite3.connect(codex_home / "state_5.sqlite")
     if with_model:
@@ -37,6 +44,23 @@ def create_threads_db(codex_home, *, with_model: bool = True) -> None:
                 ("already-current", "new_provider"),
             ],
         )
+    conn.commit()
+    conn.close()
+
+
+def create_threads_db_with_updated_at(codex_home) -> None:
+    conn = sqlite3.connect(codex_home / "state_5.sqlite")
+    conn.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, model TEXT, updated_at INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO threads (id, model_provider, model, updated_at) VALUES (?, ?, ?, ?)",
+        [
+            ("old-current-model", "old_provider", "gpt-new", 10),
+            ("latest-current-model", "new_provider", "gpt-new", 30),
+            ("newer-other-model", "other_provider", "gpt-other", 40),
+        ],
+    )
     conn.commit()
     conn.close()
 
@@ -115,6 +139,19 @@ class SyncBackendTests(unittest.TestCase):
                     ("old_provider", "gpt-old", 1),
                 ],
             )
+
+    def test_status_infers_provider_from_latest_thread_matching_current_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config_without_provider(codex_home)
+            create_threads_db_with_updated_at(codex_home)
+            paths = resolve_paths(str(codex_home))
+
+            status = get_status(paths)
+
+            self.assertEqual(status["current_provider"], "new_provider")
+            self.assertEqual(status["current_model"], "gpt-new")
+            self.assertEqual(status["provider_movable_threads"], 2)
 
 
 if __name__ == "__main__":
