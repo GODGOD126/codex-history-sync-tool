@@ -6,6 +6,9 @@ __pycache__/
 *.lnk
 Thumbs.db
 .DS_Store
+.build/
+.swiftpm/
+*.app/
 
 # Local Codex data and generated backups should never be committed.
 .codex/

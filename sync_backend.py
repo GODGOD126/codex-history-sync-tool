@@ -99,16 +99,72 @@ def write_text_exact(path: Path, text: str) -> None:
             temp_path.unlink()
 
 
-def parse_current_provider(config_text: str) -> str:
+def parse_current_provider(config_text: str) -> str | None:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
     if not match:
-        raise RuntimeError("Could not find model_provider in config.toml.")
+        return None
     return match.group(1)
 
 
 def parse_current_model(config_text: str) -> str | None:
     match = re.search(r'(?m)^\s*model\s*=\s*"([^"]+)"', config_text)
     return match.group(1) if match else None
+
+
+def timestamp_order_columns(columns: set[str]) -> list[str]:
+    return [
+        column
+        for column in ("updated_at_ms", "updated_at", "created_at_ms", "created_at")
+        if column in columns
+    ]
+
+
+def infer_current_provider(
+    conn: sqlite3.Connection,
+    columns: set[str],
+    current_model: str | None,
+    config_path: Path,
+) -> str:
+    order_columns = timestamp_order_columns(columns)
+    order_sql = ", ".join(f"{column} DESC" for column in order_columns)
+    if order_sql:
+        order_sql += ", id DESC"
+    else:
+        order_sql = "id DESC"
+
+    if current_model and "model" in columns:
+        row = conn.execute(
+            f"""
+            SELECT model_provider
+            FROM threads
+            WHERE model = ?
+              AND model_provider IS NOT NULL
+              AND model_provider <> ''
+            ORDER BY {order_sql}
+            LIMIT 1
+            """,
+            (current_model,),
+        ).fetchone()
+        if row and row["model_provider"]:
+            return str(row["model_provider"])
+
+    row = conn.execute(
+        f"""
+        SELECT model_provider
+        FROM threads
+        WHERE model_provider IS NOT NULL
+          AND model_provider <> ''
+        ORDER BY {order_sql}
+        LIMIT 1
+        """
+    ).fetchone()
+    if row and row["model_provider"]:
+        return str(row["model_provider"])
+
+    raise RuntimeError(
+        "Could not find model_provider in config.toml and could not infer it "
+        f"from local threads database: {config_path}"
+    )
 
 
 @contextmanager
@@ -662,22 +718,28 @@ def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, 
 def get_status(paths: Paths) -> dict[str, object]:
     ensure_environment(paths)
     config_text = read_text(paths.config_path)
-    current_provider = parse_current_provider(config_text)
+    config_provider = parse_current_provider(config_text)
     current_model = parse_current_model(config_text)
     session_records = scan_session_records(paths)
-    session_provider_counts = ordered_counts([record.model_provider for record in session_records])
-    session_model_counts = ordered_counts([record.model or "(empty)" for record in session_records])
-    session_movable_ids = {
-        record.thread_id
-        for record in session_records
-        if record.model_provider != current_provider
-        or (current_model is not None and record.model != current_model)
-    }
     should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
     index_entries = read_session_index(paths)
 
     with connect_db(paths.db_path, readonly=True) as conn:
         columns = get_thread_columns(conn)
+        current_provider = config_provider or infer_current_provider(
+            conn,
+            columns,
+            current_model,
+            paths.config_path,
+        )
+        session_provider_counts = ordered_counts([record.model_provider for record in session_records])
+        session_model_counts = ordered_counts([record.model or "(empty)" for record in session_records])
+        session_movable_ids = {
+            record.thread_id
+            for record in session_records
+            if record.model_provider != current_provider
+            or (current_model is not None and record.model != current_model)
+        }
         counts = query_provider_counts(conn)
         model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
         provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
