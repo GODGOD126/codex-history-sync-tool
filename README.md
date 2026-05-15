@@ -41,7 +41,7 @@
 ### macOS
 
 - macOS 13 或更高版本
-- Xcode / Command Line Tools，能运行 `swift build`
+- Xcode 16 / Swift 6.0 或更高版本，能运行 `swift build`
 - 本机存在 Codex Desktop 本地数据目录，通常是 `~/.codex`
 
 ## 快速使用
