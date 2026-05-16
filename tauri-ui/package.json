@@ -1,0 +1,14 @@
+{
+  "name": "codex-history-sync-tauri",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tauri desktop shell for Codex History Sync Tool.",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

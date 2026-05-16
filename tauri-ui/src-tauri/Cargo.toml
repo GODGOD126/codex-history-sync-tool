@@ -1,0 +1,14 @@
+[package]
+name = "codex-history-sync-tauri"
+version = "0.1.0"
+description = "Tauri desktop shell for Codex History Sync Tool"
+authors = ["Codex"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
