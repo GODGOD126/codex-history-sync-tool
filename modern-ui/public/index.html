@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex History Sync Dashboard</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-frame">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">CH</span>
+          <div>
+            <strong data-i18n="brandTitle"></strong>
+            <span data-i18n="brandSubtitle"></span>
+          </div>
+        </div>
+        <nav class="nav-stack">
+          <button class="active" data-nav-target="top" data-i18n="navOverview"></button>
+          <button data-nav-target="workflow" data-nav-action="dryRun" data-i18n="navPreview"></button>
+          <button data-nav-target="backups" data-i18n="navBackups"></button>
+          <button data-nav-target="backups" data-nav-action="restorePreview" data-i18n="navRestore"></button>
+          <button data-nav-target="activity" data-i18n="navSettings"></button>
+        </nav>
+        <div class="side-note">
+          <span data-i18n="sideLabel"></span>
+          <strong id="sidePending">--</strong>
+        </div>
+      </aside>
+
+      <main id="top" class="shell">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" data-i18n="eyebrow"></p>
+            <h1 data-i18n="title"></h1>
+          </div>
+          <div class="top-actions">
+            <span id="pendingBadge" class="badge" data-i18n="loading"></span>
+            <button id="backupButton" class="ghost-button" data-i18n="createBackup"></button>
+          </div>
+        </header>
+
+        <section class="status-strip" aria-label="summary">
+          <article>
+            <span data-i18n="threadsIndexed"></span>
+            <strong id="threadCount">--</strong>
+          </article>
+          <article>
+            <span data-i18n="currentScope"></span>
+            <strong id="scopeCount" data-i18n="all"></strong>
+          </article>
+          <article>
+            <span data-i18n="pendingChanges"></span>
+            <strong id="pendingCount">--</strong>
+          </article>
+          <article>
+            <span data-i18n="environment"></span>
+            <strong id="doctorStatus">--</strong>
+          </article>
+        </section>
+
+        <section class="workspace">
+          <section id="workflow" class="panel primary-panel">
+            <div class="panel-heading">
+              <div>
+                <h2 data-i18n="workflowTitle"></h2>
+                <p data-i18n="workflowText"></p>
+              </div>
+              <label class="switch-row">
+                <input id="scopeToggle" type="checkbox" />
+                <span data-i18n="limitProject"></span>
+              </label>
+            </div>
+            <div class="path-row">
+              <input id="cwdInput" type="text" placeholder="C:\path\to\your\project" />
+            </div>
+            <div class="button-row">
+              <button id="dryRunButton" class="secondary-button" data-i18n="dryRun"></button>
+              <button id="syncButton" class="primary-button" data-i18n="syncNow"></button>
+            </div>
+          </section>
+
+          <aside id="ownership" class="panel inspector-panel">
+            <div class="panel-heading compact">
+              <h2 data-i18n="ownershipTitle"></h2>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th data-i18n="count"></th>
+                  <th data-i18n="source"></th>
+                </tr>
+              </thead>
+              <tbody id="providerRows"></tbody>
+            </table>
+          </aside>
+        </section>
+
+        <section class="workspace lower">
+          <section id="backups" class="panel backup-panel">
+            <div class="panel-heading">
+              <div>
+                <h2 data-i18n="backupsTitle"></h2>
+                <p data-i18n="backupsText"></p>
+              </div>
+              <div class="panel-actions">
+                <button id="openBackupsButton" class="ghost-button" data-i18n="openBackups"></button>
+                <button id="manifestButton" class="ghost-button" data-i18n="viewManifest"></button>
+                <button id="restorePreviewButton" class="ghost-button" data-i18n="previewRestore"></button>
+                <button id="restoreSelectedButton" class="danger-button" data-i18n="restoreSelected"></button>
+                <button id="restoreLatestButton" class="danger-button" data-i18n="restoreLatest"></button>
+              </div>
+            </div>
+            <div id="backupList" class="backup-list"></div>
+          </section>
+
+          <section id="activity" class="panel log-panel">
+            <div class="panel-heading compact">
+              <h2 data-i18n="activityTitle"></h2>
+            </div>
+            <pre id="logOutput"></pre>
+          </section>
+        </section>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>

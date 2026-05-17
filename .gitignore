@@ -10,3 +10,9 @@ Thumbs.db
 # Local Codex data and generated backups should never be committed.
 .codex/
 history_sync_backups/
+modern-ui/node_modules/
+tauri-ui/node_modules/
+tauri-ui/src-tauri/target/
+tauri-ui/src-tauri/gen/
+tauri-ui/src-tauri/icons/android/
+tauri-ui/src-tauri/icons/ios/

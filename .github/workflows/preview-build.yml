@@ -1,0 +1,87 @@
+name: Preview Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "codex/**"
+  workflow_dispatch:
+
+jobs:
+  web-and-tests:
+    name: Web and backend checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run backend tests
+        run: py -3 -m unittest discover -s tests -v
+      - name: Check Web UI JavaScript
+        run: |
+          node --check modern-ui/public/app.js
+          node --check modern-ui/server.js
+      - name: Check WinForms startup
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1 -SmokeTest
+      - name: Upload Web UI preview source
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-history-sync-web-preview
+          path: |
+            modern-ui/**
+            sync_backend.py
+            README.md
+            LICENSE
+          if-no-files-found: error
+
+  tauri-preview:
+    name: Tauri preview (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact-name: codex-history-sync-windows-preview
+            bundle-glob: tauri-ui/src-tauri/target/release/bundle/**/*
+            binary-glob: tauri-ui/src-tauri/target/release/*.exe
+          - os: macos-latest
+            artifact-name: codex-history-sync-macos-preview
+            bundle-glob: tauri-ui/src-tauri/target/release/bundle/**/*
+            binary-glob: tauri-ui/src-tauri/target/release/codex-history-sync-tauri
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tauri-ui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Install Tauri dependencies
+        run: npm ci
+        working-directory: tauri-ui
+      - name: Build Tauri preview
+        run: npm run build
+        working-directory: tauri-ui
+      - name: Upload Tauri preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: |
+            ${{ matrix.bundle-glob }}
+            ${{ matrix.binary-glob }}
+          if-no-files-found: error
