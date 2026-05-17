@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Desktop History Recovery"
+  short_description: "Recover hidden native Codex Desktop history"
+  default_prompt: "Use $codex-desktop-history-recovery to recover missing native Codex Desktop chats and reopen older hidden threads safely."

@@ -97,6 +97,7 @@ py -3 -m unittest discover -s tests -v
 
 - `sync_backend.py`：后端同步、备份、恢复逻辑
 - `launch_ui.ps1`：Windows 图形界面
+- `skills/codex-desktop-history-recovery/`：面向 Codex agent 的恢复 skill，补充全文搜索、按需导入和本地历史门户能力
 
 ## 免责声明
 
