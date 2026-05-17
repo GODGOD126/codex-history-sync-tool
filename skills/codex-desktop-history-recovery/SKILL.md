@@ -46,8 +46,8 @@ py -3 .\sync_backend.py --json sync
 
 ```powershell
 py -3 .\skills\codex-desktop-history-recovery\scripts\open_codex_history.py --stats
-py -3 .\skills\codex-desktop-history-recovery\scripts\open_codex_history.py "周报"
-py -3 .\skills\codex-desktop-history-recovery\scripts\open_codex_history.py "周报" --pick 1
+py -3 .\skills\codex-desktop-history-recovery\scripts\open_codex_history.py "project keyword"
+py -3 .\skills\codex-desktop-history-recovery\scripts\open_codex_history.py "project keyword" --pick 1
 ```
 
 Use `--codex-home <path>` when the active home is not the default.
@@ -61,7 +61,7 @@ py -3 .\skills\codex-desktop-history-recovery\scripts\codex_history_portal.py
 Useful options:
 
 ```powershell
-py -3 .\skills\codex-desktop-history-recovery\scripts\codex_history_portal.py --codex-home "D:\custom\.codex" --visible-limit 150
+py -3 .\skills\codex-desktop-history-recovery\scripts\codex_history_portal.py --codex-home "C:\path\to\.codex" --visible-limit 150
 ```
 
 The portal groups projects, searches metadata and rollout text, and can promote one selected native Desktop thread back into the recent window before opening it.
