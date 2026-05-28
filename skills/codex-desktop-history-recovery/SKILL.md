@@ -41,6 +41,7 @@ py -3 .\sync_backend.py --json sync
 - **Provider/model mismatch**: keep using `sync_backend.py`.
 - **Rows exist but older chats are outside the recent sidebar window**: use the bundled search/import helpers below.
 - **Rows look malformed**: read [troubleshooting.md](references/troubleshooting.md) before changing the database.
+- **Rollouts exist but DB rows are missing**: audit native completeness before restoring from snapshots.
 
 4. Search or reopen native Desktop-only chats with the bundled helper.
 
@@ -66,6 +67,14 @@ py -3 .\skills\codex-desktop-history-recovery\scripts\codex_history_portal.py --
 
 The portal groups projects, searches metadata and rollout text, and can promote one selected native Desktop thread back into the recent window before opening it.
 
+6. If the user still remembers missing native Desktop history, run the integrity audit.
+
+```powershell
+py -3 .\skills\codex-desktop-history-recovery\scripts\audit_native_history_integrity.py --codex-home "C:\path\to\.codex"
+```
+
+If the audit reports native Desktop rollouts missing from the database, use `restore_missing_desktop_threads_from_snapshot.py` with a known-good snapshot. If a known conversation exists but its title is missing or replaced by raw prompt text, use `restore_titles_from_snapshot.py`. Both tools dry-run by default and back up before applying changes.
+
 ## When To Read The Reference
 
 Read [troubleshooting.md](references/troubleshooting.md) when:
@@ -75,6 +84,8 @@ Read [troubleshooting.md](references/troubleshooting.md) when:
 - `threads.has_user_event` is unexpectedly zero-heavy.
 - the same project appears split across multiple path spellings.
 - native Desktop rows exist, but the sidebar still appears incomplete after `sync`.
+- a known conversation is only findable by content, not by its remembered title.
+- the database count is lower than the native Desktop rollout count.
 
 ## Validation
 
@@ -85,3 +96,4 @@ Before declaring success:
 3. Confirm no non-Desktop originators were introduced.
 4. Search at least one known older thread and reopen it successfully.
 5. If using the portal, confirm the user can find hidden threads without bulk-importing unrelated history.
+6. For completeness-sensitive recoveries, confirm `db_native_desktop_threads == rollout_native_desktop_threads` and `missing_native_desktop_from_db_count == 0`.
