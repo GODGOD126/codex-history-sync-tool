@@ -1,6 +1,6 @@
 ---
 name: codex-desktop-history-recovery
-description: Recover, inspect, search, and reopen local Codex Desktop history when chats still exist on disk but are missing or incomplete in the sidebar. Use for provider/model switches, partially missing project history, hidden older threads, sidebar restoration checks, and native Desktop-only recovery where VS Code/plugin or other originators must not be mixed into Codex Desktop history.
+description: Recover, inspect, search, and reopen local Codex Desktop history when chats still exist on disk but are missing or incomplete in the sidebar. Use for requests like "fix Codex history", "repair Codex history abnormality", "帮我修复 Codex 历史记录异常", provider/model switches, partially missing project history, hidden older threads, sidebar restoration checks, and native Desktop-only recovery where VS Code/plugin or other originators must not be mixed into Codex Desktop history.
 ---
 
 # Codex Desktop History Recovery
@@ -8,6 +8,10 @@ description: Recover, inspect, search, and reopen local Codex Desktop history wh
 ## Goal
 
 Restore native Codex Desktop history conservatively, keep local files intact, and make older hidden threads searchable and reopenable even when the Desktop sidebar only shows a recent window.
+
+## Trigger Shortcut
+
+If the user says a short request such as "fix Codex history", "repair Codex history abnormality", or "帮我修复这个 Codex 历史记录异常", proactively use this skill and start from the safe backend and native-completeness audit. The user should not need to restate the full recovery procedure.
 
 ## Core Rules
 
