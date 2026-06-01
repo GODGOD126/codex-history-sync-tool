@@ -344,10 +344,26 @@ def print_stats(db_path: Path) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def open_thread(thread_id: str) -> None:
+def launch_codex_app() -> dict[str, str]:
+    app_id = os.environ.get("CODEX_DESKTOP_APPID", "OpenAI.Codex_2p2nqsd0c76g0!App")
+    subprocess.Popen(
+        ["explorer.exe", f"shell:AppsFolder\\{app_id}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return {"open_mode": "app", "app_id": app_id}
+
+
+def open_thread(thread_id: str) -> dict[str, str]:
     if sys.platform != "win32":
-        raise RuntimeError("codex:// open is only implemented for Windows here")
-    os.startfile(f"codex://threads/{thread_id}")  # type: ignore[attr-defined]
+        raise RuntimeError("Codex Desktop launch is only implemented for Windows here")
+    if os.environ.get("CODEX_HISTORY_OPEN_MODE", "").casefold() == "deeplink":
+        os.startfile(f"codex://threads/{thread_id}")  # type: ignore[attr-defined]
+        return {"open_mode": "deeplink", "uri": f"codex://threads/{thread_id}"}
+    result = launch_codex_app()
+    result["thread_id"] = thread_id
+    return result
 
 
 def main() -> None:
@@ -363,7 +379,7 @@ def main() -> None:
     parser.add_argument("--metadata-only", action="store_true", help="Do not scan rollout JSONL full text.")
     parser.add_argument("--include-archived", action="store_true", help="Also search archived native Desktop threads.")
     parser.add_argument("--keep-archived", action="store_true", help="Do not unarchive a selected archived thread.")
-    parser.add_argument("--no-open", action="store_true", help="Promote selected thread but do not launch codex://.")
+    parser.add_argument("--no-open", action="store_true", help="Promote selected thread but do not launch Codex Desktop.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--stats", action="store_true", help="Print native Codex Desktop history counts and active project distribution.")
@@ -424,8 +440,7 @@ def main() -> None:
         unarchive=not args.keep_archived,
     )
     if should_open and not args.no_open and not args.dry_run:
-        open_thread(selected[0]["id"])
-        result["opened"] = f"codex://threads/{selected[0]['id']}"
+        result["opened"] = open_thread(selected[0]["id"])
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

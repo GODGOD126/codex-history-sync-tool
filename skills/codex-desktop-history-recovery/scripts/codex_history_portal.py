@@ -671,8 +671,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                 rows = selected_rows_by_ids(ids, include_archived=True)
                 result = promote_rows(CODEX_HOME, rows, dry_run=False, unarchive=True)
                 if payload.get("open") and rows:
-                    open_thread(rows[0]["id"])
-                    result["opened"] = f"codex://threads/{rows[0]['id']}"
+                    result["opened"] = open_thread(rows[0]["id"])
                 respond_json(self, result)
                 return
             respond_json(self, {"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
