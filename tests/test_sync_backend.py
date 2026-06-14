@@ -25,8 +25,10 @@ def write_config_without_provider(codex_home, model: str = "gpt-new") -> None:
     )
 
 
-def create_threads_db(codex_home, *, with_model: bool = True) -> None:
-    conn = sqlite3.connect(codex_home / "state_5.sqlite")
+def create_threads_db(codex_home, *, with_model: bool = True, db_relative_path: str = "state_5.sqlite") -> None:
+    db_path = codex_home / db_relative_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
     if with_model:
         conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL, model TEXT)")
         conn.executemany(
@@ -287,6 +289,87 @@ class SyncBackendTests(unittest.TestCase):
             for payload in meta_payloads:
                 self.assertEqual(payload["model_provider"], "openai")
                 self.assertEqual(payload["model"], "gpt-5.4")
+
+    def test_sync_updates_root_and_sqlite_database_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home)
+            create_threads_db(codex_home, with_model=True, db_relative_path="state_5.sqlite")
+            create_threads_db(codex_home, with_model=True, db_relative_path="sqlite/state_5.sqlite")
+            with closing(sqlite3.connect(codex_home / "sqlite" / "state_5.sqlite")) as conn:
+                conn.execute(
+                    "UPDATE threads SET model_provider = ?, model = ? WHERE id = ?",
+                    ("custom", "gpt-old", "already-current"),
+                )
+                conn.commit()
+            paths = resolve_paths(str(codex_home))
+
+            self.assertEqual(paths.db_path, codex_home / "sqlite" / "state_5.sqlite")
+
+            status = get_status(paths)
+
+            self.assertEqual(status["db_paths"][0], str(codex_home / "sqlite" / "state_5.sqlite"))
+            self.assertEqual(status["db_paths"][1], str(codex_home / "state_5.sqlite"))
+            self.assertEqual(status["provider_movable_threads"], 2)
+            self.assertEqual(status["model_movable_threads"], 3)
+
+            result = sync_to_current_provider(paths)
+
+            self.assertEqual(result["updated_rows"], 5)
+            self.assertEqual(len(result["database_copies"]), 2)
+
+            for db_relative_path in ["state_5.sqlite", "sqlite/state_5.sqlite"]:
+                with closing(sqlite3.connect(codex_home / db_relative_path)) as conn:
+                    rows = conn.execute(
+                        "SELECT model_provider, model, COUNT(*) FROM threads GROUP BY model_provider, model"
+                    ).fetchall()
+                self.assertEqual(rows, [("new_provider", "gpt-new", 3)])
+
+    def test_restore_backup_restores_each_database_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home)
+            create_threads_db(codex_home, with_model=True, db_relative_path="state_5.sqlite")
+            create_threads_db(codex_home, with_model=True, db_relative_path="sqlite/state_5.sqlite")
+            with closing(sqlite3.connect(codex_home / "sqlite" / "state_5.sqlite")) as conn:
+                conn.execute(
+                    "UPDATE threads SET model_provider = ?, model = ? WHERE id = ?",
+                    ("custom", "gpt-special", "already-current"),
+                )
+                conn.commit()
+            paths = resolve_paths(str(codex_home))
+            backup_path = make_backup(paths, "manual")
+
+            sync_to_current_provider(paths)
+            result = restore_backup(paths, str(backup_path))
+
+            self.assertEqual(result["restored_from"], str(backup_path))
+
+            with closing(sqlite3.connect(codex_home / "state_5.sqlite")) as conn:
+                root_rows = conn.execute(
+                    "SELECT id, model_provider, model FROM threads ORDER BY id"
+                ).fetchall()
+            with closing(sqlite3.connect(codex_home / "sqlite" / "state_5.sqlite")) as conn:
+                sqlite_rows = conn.execute(
+                    "SELECT id, model_provider, model FROM threads ORDER BY id"
+                ).fetchall()
+
+            self.assertEqual(
+                root_rows,
+                [
+                    ("already-current", "new_provider", "gpt-new"),
+                    ("new-provider-old-model", "new_provider", "gpt-old"),
+                    ("old-provider-old-model", "old_provider", "gpt-old"),
+                ],
+            )
+            self.assertEqual(
+                sqlite_rows,
+                [
+                    ("already-current", "custom", "gpt-special"),
+                    ("new-provider-old-model", "new_provider", "gpt-old"),
+                    ("old-provider-old-model", "old_provider", "gpt-old"),
+                ],
+            )
 
 
 if __name__ == "__main__":

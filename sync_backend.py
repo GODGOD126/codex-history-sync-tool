@@ -34,6 +34,7 @@ class Paths:
     codex_home: Path
     config_path: Path
     db_path: Path
+    db_paths: tuple[Path, ...]
     backup_dir: Path
     session_index_path: Path
     sessions_dir: Path
@@ -54,12 +55,37 @@ class FileBusyError(RuntimeError):
         super().__init__(f"File is busy and could not be replaced: {target_path}")
 
 
+def dedupe_paths(paths: list[Path]) -> tuple[Path, ...]:
+    seen: set[str] = set()
+    output: list[Path] = []
+    for path in paths:
+        key = str(path.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(path)
+    return tuple(output)
+
+
+def discover_db_paths(home: Path) -> tuple[Path, ...]:
+    candidates = [
+        home / "sqlite" / "state_5.sqlite",
+        home / "state_5.sqlite",
+    ]
+    existing = [path for path in candidates if path.exists()]
+    if existing:
+        return dedupe_paths(existing)
+    return (home / "state_5.sqlite",)
+
+
 def resolve_paths(codex_home: str | None) -> Paths:
     home = Path(codex_home).expanduser() if codex_home else default_codex_home()
+    db_paths = discover_db_paths(home)
     return Paths(
         codex_home=home,
         config_path=home / "config.toml",
-        db_path=home / "state_5.sqlite",
+        db_path=db_paths[0],
+        db_paths=db_paths,
         backup_dir=home / "history_sync_backups",
         session_index_path=home / "session_index.jsonl",
         sessions_dir=home / "sessions",
@@ -148,8 +174,22 @@ def connect_db(
 def ensure_environment(paths: Paths) -> None:
     if not paths.config_path.exists():
         raise RuntimeError(f"Missing config file: {paths.config_path}")
-    if not paths.db_path.exists():
-        raise RuntimeError(f"Missing database file: {paths.db_path}")
+    missing_db_paths = [db_path for db_path in paths.db_paths if not db_path.exists()]
+    if missing_db_paths:
+        raise RuntimeError(f"Missing database file: {missing_db_paths[0]}")
+
+
+def db_copy_backup_path(paths: Paths, primary_backup_path: Path, db_path: Path) -> Path:
+    if db_path == paths.db_path:
+        return primary_backup_path
+
+    try:
+        relative_parent = db_path.relative_to(paths.codex_home).parent
+    except ValueError:
+        relative_parent = db_path.parent
+
+    tag = "-".join(part for part in relative_parent.parts if part) or "root"
+    return primary_backup_path.with_name(f"{primary_backup_path.name}.{tag}")
 
 
 def get_thread_columns(conn: sqlite3.Connection) -> set[str]:
@@ -648,122 +688,214 @@ def checkpoint(conn: sqlite3.Connection, mode: str = SYNC_CHECKPOINT_MODE) -> tu
     return int(row[0]), int(row[1]), int(row[2])
 
 
+def collect_db_status(
+    db_path: Path,
+    current_provider: str,
+    current_model: str | None,
+    index_entries: dict[str, dict[str, str]],
+    should_check_index: bool,
+) -> dict[str, object]:
+    with connect_db(db_path, readonly=True) as conn:
+        columns = get_thread_columns(conn)
+        counts = query_provider_counts(conn)
+        model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+        provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
+        cwd_counts = query_cwd_counts(conn) if "cwd" in columns else []
+        total_threads = int(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
+        provider_movable = count_mismatched(conn, "model_provider", current_provider)
+        model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
+        provider_movable_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM threads WHERE model_provider IS NULL OR model_provider <> ?",
+                (current_provider,),
+            )
+        }
+        model_movable_ids: set[str] = set()
+        if "model" in columns and current_model:
+            model_movable_ids = {
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM threads WHERE model IS NULL OR model <> ?",
+                    (current_model,),
+                )
+            }
+        movable_ids = provider_movable_ids | model_movable_ids
+        db_thread_query = "SELECT id FROM threads WHERE archived = 0" if "archived" in columns else "SELECT id FROM threads"
+        thread_ids = {str(row["id"]) for row in conn.execute(db_thread_query)}
+        missing_index_ids = thread_ids - set(index_entries) if should_check_index else set()
+
+    return {
+        "db_path": str(db_path),
+        "provider_counts": counts_to_rows(counts),
+        "model_counts": model_counts_to_rows(model_counts),
+        "provider_model_counts": provider_model_counts,
+        "cwd_counts": cwd_counts,
+        "total_threads": total_threads,
+        "provider_movable_threads": provider_movable,
+        "model_movable_threads": model_movable,
+        "provider_movable_ids": provider_movable_ids,
+        "model_movable_ids": model_movable_ids,
+        "movable_ids": movable_ids,
+        "thread_ids": thread_ids,
+        "missing_index_ids": missing_index_ids,
+    }
+
+
 def update_provider_assignments(
     paths: Paths,
     current_provider: str,
     current_model: str | None,
 ) -> dict[str, object]:
     started_at = time.monotonic()
-    last_error: sqlite3.OperationalError | None = None
+    db_summaries: list[dict[str, object]] = []
 
-    for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
-        try:
-            with connect_db(
-                paths.db_path,
-                readonly=False,
-                timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
-            ) as conn:
-                # 显式拿写锁，把等待控制在我们自己的重试节奏里。
-                conn.execute("BEGIN IMMEDIATE")
-                columns = get_thread_columns(conn)
-                before_counts = query_provider_counts(conn)
-                before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
-                set_parts = ["model_provider = ?"]
-                set_params = [current_provider]
-                where_parts = ["model_provider IS NULL OR model_provider <> ?"]
-                where_params = [current_provider]
-                synced_fields = ["model_provider"]
+    for db_path in paths.db_paths:
+        last_error: sqlite3.OperationalError | None = None
 
-                if "model" in columns and current_model:
-                    set_parts.append("model = ?")
-                    set_params.append(current_model)
-                    where_parts.append("model IS NULL OR model <> ?")
-                    where_params.append(current_model)
-                    synced_fields.append("model")
+        for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
+            try:
+                with connect_db(
+                    db_path,
+                    readonly=False,
+                    timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
+                ) as conn:
+                    # 显式拿写锁，把等待控制在我们自己的重试节奏里。
+                    conn.execute("BEGIN IMMEDIATE")
+                    columns = get_thread_columns(conn)
+                    before_counts = query_provider_counts(conn)
+                    before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+                    set_parts = ["model_provider = ?"]
+                    set_params = [current_provider]
+                    where_parts = ["model_provider IS NULL OR model_provider <> ?"]
+                    where_params = [current_provider]
+                    synced_fields = ["model_provider"]
 
-                set_sql = ", ".join(set_parts)
-                where_sql = " OR ".join(f"({part})" for part in where_parts)
-                updated_rows = conn.execute(
-                    f"UPDATE threads SET {set_sql} WHERE {where_sql}",
-                    (*set_params, *where_params),
-                ).rowcount
-                conn.commit()
-                after_counts = query_provider_counts(conn)
-                after_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
-                checkpoint_result = checkpoint(conn)
+                    if "model" in columns and current_model:
+                        set_parts.append("model = ?")
+                        set_params.append(current_model)
+                        where_parts.append("model IS NULL OR model <> ?")
+                        where_params.append(current_model)
+                        synced_fields.append("model")
 
-            return {
-                "attempts": attempt,
-                "lock_wait_ms": elapsed_ms(started_at),
-                "synced_fields": synced_fields,
-                "updated_rows": updated_rows,
-                "before_counts": counts_to_rows(before_counts),
-                "after_counts": counts_to_rows(after_counts),
-                "before_model_counts": model_counts_to_rows(before_model_counts),
-                "after_model_counts": model_counts_to_rows(after_model_counts),
-                "checkpoint": {
-                    "mode": SYNC_CHECKPOINT_MODE,
-                    "busy": checkpoint_result[0],
-                    "log_frames": checkpoint_result[1],
-                    "checkpointed_frames": checkpoint_result[2],
-                },
-            }
-        except sqlite3.OperationalError as exc:
-            if not is_locked_error(exc):
-                raise
-            last_error = exc
-            if attempt >= WRITE_LOCK_RETRY_LIMIT:
-                waited_seconds = (time.monotonic() - started_at)
-                raise RuntimeError(
-                    "Codex 当前正在写入本地历史数据库，"
-                    f"已等待 {waited_seconds:.1f} 秒仍未拿到写锁。"
-                    "保持 Codex 开着也可以同步，但请等当前回复、工具调用或自动保存结束后再试一次。"
-                ) from exc
-            time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+                    set_sql = ", ".join(set_parts)
+                    where_sql = " OR ".join(f"({part})" for part in where_parts)
+                    updated_rows = conn.execute(
+                        f"UPDATE threads SET {set_sql} WHERE {where_sql}",
+                        (*set_params, *where_params),
+                    ).rowcount
+                    conn.commit()
+                    after_counts = query_provider_counts(conn)
+                    after_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+                    checkpoint_result = checkpoint(conn)
 
-    raise RuntimeError("Database write lock retry loop ended unexpectedly.") from last_error
+                db_summaries.append(
+                    {
+                        "db_path": str(db_path),
+                        "attempts": attempt,
+                        "synced_fields": synced_fields,
+                        "updated_rows": updated_rows,
+                        "before_counts": counts_to_rows(before_counts),
+                        "after_counts": counts_to_rows(after_counts),
+                        "before_model_counts": model_counts_to_rows(before_model_counts),
+                        "after_model_counts": model_counts_to_rows(after_model_counts),
+                        "checkpoint": {
+                            "mode": SYNC_CHECKPOINT_MODE,
+                            "busy": checkpoint_result[0],
+                            "log_frames": checkpoint_result[1],
+                            "checkpointed_frames": checkpoint_result[2],
+                        },
+                    }
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if not is_locked_error(exc):
+                    raise
+                last_error = exc
+                if attempt >= WRITE_LOCK_RETRY_LIMIT:
+                    waited_seconds = (time.monotonic() - started_at)
+                    raise RuntimeError(
+                        "Codex 当前正在写入本地历史数据库，"
+                        f"已等待 {waited_seconds:.1f} 秒仍未拿到写锁。"
+                        "保持 Codex 开着也可以同步，但请等当前回复、工具调用或自动保存结束后再试一次。"
+                    ) from exc
+                time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+        else:
+            raise RuntimeError("Database write lock retry loop ended unexpectedly.") from last_error
+
+    primary_summary = db_summaries[0]
+    return {
+        "attempts": max(int(summary["attempts"]) for summary in db_summaries),
+        "lock_wait_ms": elapsed_ms(started_at),
+        "synced_fields": primary_summary["synced_fields"],
+        "updated_rows": sum(int(summary["updated_rows"]) for summary in db_summaries),
+        "before_counts": primary_summary["before_counts"],
+        "after_counts": primary_summary["after_counts"],
+        "before_model_counts": primary_summary["before_model_counts"],
+        "after_model_counts": primary_summary["after_model_counts"],
+        "checkpoint": primary_summary["checkpoint"],
+        "database_copies": db_summaries,
+    }
 
 
 def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, object]:
     started_at = time.monotonic()
-    last_error: sqlite3.OperationalError | None = None
+    db_summaries: list[dict[str, object]] = []
 
-    for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
-        try:
-            with connect_db(chosen_backup, readonly=True) as source, connect_db(
-                paths.db_path,
-                readonly=False,
-                timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
-            ) as target:
-                # SQLite 在整库 backup 到目标库时会自己申请所需锁；
-                # 这里直接尝试 restore，失败后统一按“数据库正忙”重试即可。
-                source.backup(target)
-                checkpoint_result = checkpoint(target)
+    for db_path in paths.db_paths:
+        chosen_db_backup = db_copy_backup_path(paths, chosen_backup, db_path)
+        if db_path != paths.db_path and not chosen_db_backup.exists():
+            chosen_db_backup = chosen_backup
 
-            return {
-                "attempts": attempt,
-                "lock_wait_ms": elapsed_ms(started_at),
-                "checkpoint": {
-                    "mode": SYNC_CHECKPOINT_MODE,
-                    "busy": checkpoint_result[0],
-                    "log_frames": checkpoint_result[1],
-                    "checkpointed_frames": checkpoint_result[2],
-                },
-            }
-        except sqlite3.OperationalError as exc:
-            if not is_locked_error(exc):
-                raise
-            last_error = exc
-            if attempt >= WRITE_LOCK_RETRY_LIMIT:
-                waited_seconds = (time.monotonic() - started_at)
-                raise RuntimeError(
-                    "Codex 当前正在写入本地历史数据库，"
-                    f"已等待 {waited_seconds:.1f} 秒仍无法完成还原。"
-                    "请等当前回复、工具调用或自动保存结束后再试一次。"
-                ) from exc
-            time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
+            try:
+                with connect_db(chosen_db_backup, readonly=True) as source, connect_db(
+                    db_path,
+                    readonly=False,
+                    timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
+                ) as target:
+                    # SQLite 在整库 backup 到目标库时会自己申请所需锁；
+                    # 这里直接尝试 restore，失败后统一按“数据库正忙”重试即可。
+                    source.backup(target)
+                    checkpoint_result = checkpoint(target)
 
-    raise RuntimeError("Database restore retry loop ended unexpectedly.") from last_error
+                db_summaries.append(
+                    {
+                        "db_path": str(db_path),
+                        "restored_from": str(chosen_db_backup),
+                        "attempts": attempt,
+                        "checkpoint": {
+                            "mode": SYNC_CHECKPOINT_MODE,
+                            "busy": checkpoint_result[0],
+                            "log_frames": checkpoint_result[1],
+                            "checkpointed_frames": checkpoint_result[2],
+                        },
+                    }
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if not is_locked_error(exc):
+                    raise
+                last_error = exc
+                if attempt >= WRITE_LOCK_RETRY_LIMIT:
+                    waited_seconds = (time.monotonic() - started_at)
+                    raise RuntimeError(
+                        "Codex 当前正在写入本地历史数据库，"
+                        f"已等待 {waited_seconds:.1f} 秒仍无法完成还原。"
+                        "请等当前回复、工具调用或自动保存结束后再试一次。"
+                    ) from exc
+                time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+        else:
+            raise RuntimeError("Database restore retry loop ended unexpectedly.") from last_error
+
+    primary_summary = db_summaries[0]
+    return {
+        "attempts": max(int(summary["attempts"]) for summary in db_summaries),
+        "lock_wait_ms": elapsed_ms(started_at),
+        "checkpoint": primary_summary["checkpoint"],
+        "database_copies": db_summaries,
+    }
 
 
 def get_status(paths: Paths) -> dict[str, object]:
@@ -784,51 +916,56 @@ def get_status(paths: Paths) -> dict[str, object]:
     should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
     index_entries = read_session_index(paths)
 
-    with connect_db(paths.db_path, readonly=True) as conn:
-        columns = get_thread_columns(conn)
-        counts = query_provider_counts(conn)
-        model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
-        provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
-        cwd_counts = query_cwd_counts(conn) if "cwd" in columns else []
-        total_threads = int(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
-        provider_movable = count_mismatched(conn, "model_provider", current_provider)
-        model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
-        where_parts = ["model_provider IS NULL OR model_provider <> ?"]
-        params: list[str] = [current_provider]
-        if "model" in columns and current_model:
-            where_parts.append("model IS NULL OR model <> ?")
-            params.append(current_model)
-        where_sql = " OR ".join(f"({part})" for part in where_parts)
-        db_movable_ids = {str(row["id"]) for row in conn.execute(f"SELECT id FROM threads WHERE {where_sql}", params)}
-        db_thread_query = "SELECT id FROM threads WHERE archived = 0" if "archived" in columns else "SELECT id FROM threads"
-        db_thread_ids = {str(row["id"]) for row in conn.execute(db_thread_query)}
-        missing_index_ids = db_thread_ids - set(index_entries) if should_check_index else set()
-        sync_candidate_ids = db_movable_ids | session_movable_ids | missing_index_ids
+    db_statuses = [
+        collect_db_status(db_path, current_provider, current_model, index_entries, should_check_index)
+        for db_path in paths.db_paths
+    ]
+    primary_db_status = db_statuses[0]
+    has_model_tracking = any(status["model_movable_threads"] is not None for status in db_statuses)
+    provider_movable_ids = set().union(*(status["provider_movable_ids"] for status in db_statuses))
+    model_movable_ids = set().union(*(status["model_movable_ids"] for status in db_statuses))
+    db_movable_ids = set().union(*(status["movable_ids"] for status in db_statuses))
+    db_thread_ids = set().union(*(status["thread_ids"] for status in db_statuses))
+    missing_index_ids = set().union(*(status["missing_index_ids"] for status in db_statuses))
+    sync_candidate_ids = db_movable_ids | session_movable_ids | missing_index_ids
 
     return {
         "codex_home": str(paths.codex_home),
         "config_path": str(paths.config_path),
         "db_path": str(paths.db_path),
+        "db_paths": [str(db_path) for db_path in paths.db_paths],
         "session_index_path": str(paths.session_index_path),
         "sessions_dir": str(paths.sessions_dir),
         "backup_dir": str(paths.backup_dir),
         "current_provider": current_provider,
         "current_model": current_model,
-        "total_threads": total_threads,
+        "total_threads": primary_db_status["total_threads"],
         "movable_threads": len(sync_candidate_ids),
-        "provider_movable_threads": provider_movable,
-        "model_movable_threads": model_movable,
+        "provider_movable_threads": len(provider_movable_ids),
+        "model_movable_threads": len(model_movable_ids) if has_model_tracking and current_model is not None else None,
         "movable_database_threads": len(db_movable_ids),
         "movable_session_threads": len(session_movable_ids),
         "missing_session_index_entries": len(missing_index_ids),
         "indexed_threads": len(index_entries),
         "session_file_count": len(session_records),
-        "provider_counts": counts_to_rows(counts),
-        "model_counts": model_counts_to_rows(model_counts),
-        "provider_model_counts": provider_model_counts,
-        "cwd_counts": cwd_counts,
+        "provider_counts": primary_db_status["provider_counts"],
+        "model_counts": primary_db_status["model_counts"],
+        "provider_model_counts": primary_db_status["provider_model_counts"],
+        "cwd_counts": primary_db_status["cwd_counts"],
         "session_provider_counts": counts_to_rows(session_provider_counts),
         "session_model_counts": model_counts_to_rows(session_model_counts),
+        "database_copies": [
+            {
+                "db_path": status["db_path"],
+                "total_threads": status["total_threads"],
+                "provider_movable_threads": status["provider_movable_threads"],
+                "model_movable_threads": status["model_movable_threads"],
+                "missing_session_index_entries": len(status["missing_index_ids"]),
+                "provider_counts": status["provider_counts"],
+                "model_counts": status["model_counts"],
+            }
+            for status in db_statuses
+        ],
         "backups": list_backups(paths),
     }
 
@@ -838,10 +975,12 @@ def make_backup(paths: Paths, label: str) -> Path:
     paths.backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_path = paths.backup_dir / f"state_5.sqlite.{label}.{timestamp}.bak"
-    with connect_db(paths.db_path, readonly=True) as source, connect_db(backup_path, readonly=False) as target:
-        source.backup(target)
+    for db_path in paths.db_paths:
+        current_backup_path = db_copy_backup_path(paths, backup_path, db_path)
+        with connect_db(db_path, readonly=True) as source, connect_db(current_backup_path, readonly=False) as target:
+            source.backup(target)
+        current_backup_path.touch()
     snapshot_metadata(paths, backup_path)
-    backup_path.touch()
     return backup_path
 
 
@@ -885,6 +1024,7 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
         "session_before_model_counts": session_summary["session_before_model_counts"],
         "session_after_model_counts": session_summary["session_after_model_counts"],
         "checkpoint": db_summary["checkpoint"],
+        "database_copies": db_summary["database_copies"],
         "lock_wait_ms": db_summary["lock_wait_ms"],
         "lock_attempts": db_summary["attempts"],
         "rewritten_index_entries": index_summary["rewritten_index_entries"],
@@ -939,6 +1079,7 @@ def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
         "safety_backup": str(restore_snapshot),
         "metadata_restore": restore_summary,
         "checkpoint": restore_db_summary["checkpoint"],
+        "database_copies": restore_db_summary["database_copies"],
         "lock_wait_ms": restore_db_summary["lock_wait_ms"],
         "lock_attempts": restore_db_summary["attempts"],
         "rewritten_index_entries": index_summary["rewritten_index_entries"],
