@@ -45,6 +45,7 @@ class SessionRecord:
     path: Path
     model_provider: str
     model: str | None
+    has_inconsistent_meta: bool = False
 
 
 class FileBusyError(RuntimeError):
@@ -282,6 +283,10 @@ def split_first_line(text: str) -> tuple[str, str, str]:
     return text, "", ""
 
 
+def split_lines_exact(text: str) -> list[str]:
+    return text.splitlines(keepends=True)
+
+
 def replace_first_line(path: Path, first_line: str) -> None:
     text = read_text_exact(path)
     _, ending, remainder = split_first_line(text)
@@ -292,6 +297,29 @@ def replace_first_line(path: Path, first_line: str) -> None:
     else:
         new_text = first_line + "\n"
     write_text_exact(path, new_text)
+
+
+def replace_specific_lines(path: Path, replacements: dict[int, str]) -> None:
+    text = read_text_exact(path)
+    lines = split_lines_exact(text)
+    if not lines:
+        return
+
+    for line_number, replacement in replacements.items():
+        index = line_number - 1
+        if index < 0 or index >= len(lines):
+            continue
+        original_line = lines[index]
+        ending = ""
+        if original_line.endswith("\r\n"):
+            ending = "\r\n"
+        elif original_line.endswith("\n"):
+            ending = "\n"
+        elif original_line.endswith("\r"):
+            ending = "\r"
+        lines[index] = replacement + ending
+
+    write_text_exact(path, "".join(lines))
 
 
 def session_index_backup_path(backup_path: Path) -> Path:
@@ -308,32 +336,65 @@ def iter_session_paths(paths: Paths) -> list[Path]:
     return sorted(paths.sessions_dir.rglob("rollout-*.jsonl"))
 
 
-def parse_session_record(path: Path) -> SessionRecord | None:
-    if not SESSION_FILENAME_PATTERN.search(path.name):
-        return None
-
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        first_line = handle.readline()
-
-    if not first_line:
-        return None
-
-    item = json.loads(first_line.rstrip("\r\n"))
+def parse_session_meta_item(line: str) -> dict[str, object] | None:
+    item = json.loads(line.rstrip("\r\n"))
     if item.get("type") != "session_meta":
         return None
 
     payload = item.get("payload")
     if not isinstance(payload, dict):
         return None
+    return payload
 
-    thread_id = str(payload.get("id") or "").strip()
+
+def parse_session_record(path: Path) -> SessionRecord | None:
+    if not SESSION_FILENAME_PATTERN.search(path.name):
+        return None
+
+    first_payload: dict[str, object] | None = None
+    has_inconsistent_meta = False
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
+                continue
+            try:
+                payload = parse_session_meta_item(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if payload is None:
+                continue
+
+            if first_payload is None:
+                first_payload = payload
+                continue
+
+            first_provider = str(first_payload.get("model_provider") or "")
+            current_provider = str(payload.get("model_provider") or "")
+            first_model_raw = first_payload.get("model")
+            current_model_raw = payload.get("model")
+            first_model = str(first_model_raw) if first_model_raw else None
+            current_model = str(current_model_raw) if current_model_raw else None
+            if current_provider != first_provider or current_model != first_model:
+                has_inconsistent_meta = True
+
+    if first_payload is None:
+        return None
+
+    thread_id = str(first_payload.get("id") or "").strip()
     if not thread_id:
         return None
 
-    model_provider = str(payload.get("model_provider") or "")
-    raw_model = payload.get("model")
+    model_provider = str(first_payload.get("model_provider") or "")
+    raw_model = first_payload.get("model")
     model = str(raw_model) if raw_model else None
-    return SessionRecord(thread_id=thread_id, path=path, model_provider=model_provider, model=model)
+    return SessionRecord(
+        thread_id=thread_id,
+        path=path,
+        model_provider=model_provider,
+        model=model,
+        has_inconsistent_meta=has_inconsistent_meta,
+    )
 
 
 def scan_session_records(paths: Paths) -> list[SessionRecord]:
@@ -391,11 +452,22 @@ def snapshot_metadata(paths: Paths, backup_path: Path) -> None:
     if paths.session_index_path.exists():
         write_text_exact(session_index_backup_path(backup_path), read_text_exact(paths.session_index_path))
 
-    items: list[dict[str, str]] = []
+    items: list[dict[str, object]] = []
     for path in iter_session_paths(paths):
+        meta_lines: list[dict[str, object]] = []
         with path.open("r", encoding="utf-8", newline="") as handle:
-            first_line = handle.readline().rstrip("\r\n")
-        if not first_line:
+            for line_number, raw_line in enumerate(handle, 1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    payload = parse_session_meta_item(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if payload is None:
+                    continue
+                meta_lines.append({"line_number": line_number, "line": raw_line.rstrip("\r\n")})
+
+        if not meta_lines:
             continue
 
         try:
@@ -403,7 +475,7 @@ def snapshot_metadata(paths: Paths, backup_path: Path) -> None:
         except ValueError:
             relative_path = path
 
-        items.append({"path": str(relative_path), "first_line": first_line})
+        items.append({"path": str(relative_path), "meta_lines": meta_lines})
 
     write_text_exact(
         session_meta_backup_path(backup_path),
@@ -428,8 +500,15 @@ def restore_metadata(paths: Paths, backup_path: Path) -> dict[str, object]:
             path = raw_path if raw_path.is_absolute() else paths.codex_home / raw_path
             if not path.exists():
                 continue
-            # 只恢复首行 session_meta，后面的对话内容保持原文件不动。
-            replace_first_line(path, str(item["first_line"]))
+            replacements = {
+                int(meta_item["line_number"]): str(meta_item["line"])
+                for meta_item in item.get("meta_lines", [])
+            }
+            if not replacements and "first_line" in item:
+                replacements = {1: str(item["first_line"])}
+            if not replacements:
+                continue
+            replace_specific_lines(path, replacements)
             session_files_restored += 1
 
     return {
@@ -494,37 +573,48 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
     before_records = scan_session_records(paths)
     updated_session_files = 0
     skipped_busy_session_files: list[str] = []
+    updated_session_meta_lines = 0
 
     for record in before_records:
         model_matches = current_model is None or record.model == current_model
-        if record.model_provider == current_provider and model_matches:
+        if record.model_provider == current_provider and model_matches and not record.has_inconsistent_meta:
             continue
 
-        text = read_text_exact(record.path)
-        first_line, ending, remainder = split_first_line(text)
-        item = json.loads(first_line)
-        payload = item.get("payload")
-        if not isinstance(payload, dict):
-            continue
+        replacements: dict[int, str] = {}
+        with record.path.open("r", encoding="utf-8", newline="") as handle:
+            for line_number, raw_line in enumerate(handle, 1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    item = json.loads(raw_line.rstrip("\r\n"))
+                except json.JSONDecodeError:
+                    continue
+                if item.get("type") != "session_meta":
+                    continue
 
-        payload["model_provider"] = current_provider
-        if current_model:
-            payload["model"] = current_model
-        new_first_line = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-        if ending:
-            new_text = new_first_line + ending + remainder
-        else:
-            new_text = new_first_line
+                payload = item.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                payload["model_provider"] = current_provider
+                if current_model:
+                    payload["model"] = current_model
+                replacements[line_number] = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+
+        if not replacements:
+            continue
         try:
-            write_text_exact(record.path, new_text)
+            replace_specific_lines(record.path, replacements)
         except FileBusyError:
             skipped_busy_session_files.append(str(record.path))
             continue
         updated_session_files += 1
+        updated_session_meta_lines += len(replacements)
 
     after_records = scan_session_records(paths)
     return {
         "updated_session_files": updated_session_files,
+        "updated_session_meta_lines": updated_session_meta_lines,
         "skipped_busy_session_files": len(skipped_busy_session_files),
         "skipped_busy_session_paths": skipped_busy_session_files,
         "session_before_counts": counts_to_rows(
@@ -687,7 +777,8 @@ def get_status(paths: Paths) -> dict[str, object]:
     session_movable_ids = {
         record.thread_id
         for record in session_records
-        if record.model_provider != current_provider
+        if record.has_inconsistent_meta
+        or record.model_provider != current_provider
         or (current_model is not None and record.model != current_model)
     }
     should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
@@ -779,6 +870,7 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
         "synced_fields": db_summary["synced_fields"],
         "updated_rows": db_summary["updated_rows"],
         "updated_session_files": session_summary["updated_session_files"],
+        "updated_session_meta_lines": session_summary["updated_session_meta_lines"],
         "skipped_busy_session_files": session_summary["skipped_busy_session_files"],
         "skipped_busy_session_paths": session_summary["skipped_busy_session_paths"],
         "provider_movable_threads": status_before["provider_movable_threads"],

@@ -57,6 +57,7 @@ def create_session_file(
     model_provider: str,
     model: str | None,
     slug: str,
+    extra_meta_entries: list[dict[str, object]] | None = None,
 ) -> Path:
     session_dir = codex_home / "sessions" / "2026" / "06" / "15"
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -70,10 +71,11 @@ def create_session_file(
     }
     if model is not None:
         meta["payload"]["model"] = model
-    session_path.write_text(
-        f'{json.dumps(meta, ensure_ascii=False)}\n{{"type":"message"}}\n',
-        encoding="utf-8",
-    )
+    lines = [json.dumps(meta, ensure_ascii=False)]
+    for extra_meta in extra_meta_entries or []:
+        lines.append(json.dumps(extra_meta, ensure_ascii=False))
+    lines.append('{"type":"message"}')
+    session_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return session_path
 
 
@@ -208,6 +210,83 @@ class SyncBackendTests(unittest.TestCase):
             self.assertEqual(locked_meta["payload"]["model"], "gpt-5.5")
             self.assertEqual(updated_meta["payload"]["model_provider"], "openai")
             self.assertEqual(updated_meta["payload"]["model"], "gpt-5.4")
+
+    def test_status_marks_session_file_for_sync_when_later_meta_lines_still_use_custom(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home, provider="openai", model="gpt-5.4")
+            create_threads_db(codex_home, with_model=True)
+            create_session_file(
+                codex_home,
+                thread_id="33333333-3333-3333-3333-333333333333",
+                model_provider="openai",
+                model="gpt-5.4",
+                slug="2026-06-15T03-22-05",
+                extra_meta_entries=[
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "33333333-3333-3333-3333-333333333333",
+                            "model_provider": "custom",
+                            "model": None,
+                        },
+                    }
+                ],
+            )
+            paths = resolve_paths(str(codex_home))
+
+            status = get_status(paths)
+
+            self.assertEqual(status["movable_session_threads"], 1)
+            self.assertEqual(status["movable_threads"], 4)
+
+    def test_sync_rewrites_all_session_meta_lines_not_just_the_first_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home, provider="openai", model="gpt-5.4")
+            create_threads_db(codex_home, with_model=True)
+            session_path = create_session_file(
+                codex_home,
+                thread_id="44444444-4444-4444-4444-444444444444",
+                model_provider="openai",
+                model="gpt-5.4",
+                slug="2026-06-15T03-22-06",
+                extra_meta_entries=[
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "44444444-4444-4444-4444-444444444444",
+                            "model_provider": "custom",
+                            "model": None,
+                        },
+                    },
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "44444444-4444-4444-4444-444444444444",
+                            "model_provider": "custom",
+                            "model": None,
+                        },
+                    },
+                ],
+            )
+            paths = resolve_paths(str(codex_home))
+
+            result = sync_to_current_provider(paths)
+
+            self.assertEqual(result["updated_session_files"], 1)
+            self.assertEqual(result["updated_session_meta_lines"], 3)
+
+            lines = session_path.read_text(encoding="utf-8").splitlines()
+            meta_payloads = [
+                json.loads(line)["payload"]
+                for line in lines
+                if json.loads(line).get("type") == "session_meta"
+            ]
+            self.assertTrue(meta_payloads)
+            for payload in meta_payloads:
+                self.assertEqual(payload["model_provider"], "openai")
+                self.assertEqual(payload["model"], "gpt-5.4")
 
 
 if __name__ == "__main__":

@@ -408,6 +408,9 @@ $syncButton.Add_Click({
     Set-Busy -Busy $true -Message '正在同步历史，Codex 忙的时候会自动等一会儿...'
     $result = Invoke-Backend @('--json', 'sync')
     Append-Log "同步完成。数据库更新 $($result.updated_rows) 条，会话文件更新 $($result.updated_session_files) 个。"
+    if ($null -ne $result.updated_session_meta_lines) {
+      Append-Log "会话元数据行已修复: $($result.updated_session_meta_lines) 条。"
+    }
     if ([int]$result.skipped_busy_session_files -gt 0) {
       $skippedPaths = @($result.skipped_busy_session_paths | Select-Object -First 3)
       Append-Log "有 $($result.skipped_busy_session_files) 个活跃会话文件正在被 Codex 占用，本次先跳过。"
