@@ -101,9 +101,13 @@ def write_text_exact(path: Path, text: str) -> None:
 
 def parse_current_provider(config_text: str) -> str:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
-    if not match:
-        raise RuntimeError("Could not find model_provider in config.toml.")
-    return match.group(1)
+    if match:
+        return match.group(1)
+
+    # Newer Codex configs may omit model_provider entirely and rely on the
+    # built-in default provider instead. Official docs currently document
+    # "openai" as that default.
+    return "openai"
 
 
 def parse_current_model(config_text: str) -> str | None:

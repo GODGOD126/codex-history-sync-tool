@@ -16,6 +16,13 @@ def write_config(codex_home, provider: str = "new_provider", model: str = "gpt-n
     )
 
 
+def write_config_without_provider(codex_home, model: str = "gpt-new") -> None:
+    (codex_home / "config.toml").write_text(
+        f'model = "{model}"\n',
+        encoding="utf-8",
+    )
+
+
 def create_threads_db(codex_home, *, with_model: bool = True) -> None:
     conn = sqlite3.connect(codex_home / "state_5.sqlite")
     if with_model:
@@ -42,6 +49,21 @@ def create_threads_db(codex_home, *, with_model: bool = True) -> None:
 
 
 class SyncBackendTests(unittest.TestCase):
+    def test_status_falls_back_to_openai_when_model_provider_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config_without_provider(codex_home, model="gpt-5.4")
+            create_threads_db(codex_home, with_model=True)
+            paths = resolve_paths(str(codex_home))
+
+            status = get_status(paths)
+
+            self.assertEqual(status["current_provider"], "openai")
+            self.assertEqual(status["current_model"], "gpt-5.4")
+            self.assertEqual(status["provider_movable_threads"], 3)
+            self.assertEqual(status["model_movable_threads"], 3)
+            self.assertEqual(status["movable_threads"], 3)
+
     def test_sync_updates_provider_and_model_for_newer_codex_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir)
