@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
-from sync_backend import get_status, make_backup, resolve_paths, restore_backup, sync_to_current_provider
+from sync_backend import FileBusyError, get_status, make_backup, resolve_paths, restore_backup, sync_to_current_provider
 
 
 def write_config(codex_home, provider: str = "new_provider", model: str = "gpt-new") -> None:
@@ -46,6 +48,33 @@ def create_threads_db(codex_home, *, with_model: bool = True) -> None:
         )
     conn.commit()
     conn.close()
+
+
+def create_session_file(
+    codex_home: Path,
+    *,
+    thread_id: str,
+    model_provider: str,
+    model: str | None,
+    slug: str,
+) -> Path:
+    session_dir = codex_home / "sessions" / "2026" / "06" / "15"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_path = session_dir / f"rollout-{slug}-{thread_id}.jsonl"
+    meta = {
+        "type": "session_meta",
+        "payload": {
+            "id": thread_id,
+            "model_provider": model_provider,
+        },
+    }
+    if model is not None:
+        meta["payload"]["model"] = model
+    session_path.write_text(
+        f'{json.dumps(meta, ensure_ascii=False)}\n{{"type":"message"}}\n',
+        encoding="utf-8",
+    )
+    return session_path
 
 
 class SyncBackendTests(unittest.TestCase):
@@ -137,6 +166,48 @@ class SyncBackendTests(unittest.TestCase):
                     ("old_provider", "gpt-old", 1),
                 ],
             )
+
+    def test_sync_skips_busy_session_files_and_keeps_other_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            write_config(codex_home, provider="openai", model="gpt-5.4")
+            create_threads_db(codex_home, with_model=True)
+            locked_path = create_session_file(
+                codex_home,
+                thread_id="11111111-1111-1111-1111-111111111111",
+                model_provider="custom",
+                model="gpt-5.5",
+                slug="2026-06-15T03-22-03",
+            )
+            updated_path = create_session_file(
+                codex_home,
+                thread_id="22222222-2222-2222-2222-222222222222",
+                model_provider="custom",
+                model="gpt-5.5",
+                slug="2026-06-15T03-22-04",
+            )
+            paths = resolve_paths(str(codex_home))
+
+            from sync_backend import write_text_exact as original_write_text_exact
+
+            def flaky_write_text_exact(path: Path, text: str) -> None:
+                if path == locked_path:
+                    raise FileBusyError(path)
+                original_write_text_exact(path, text)
+
+            with patch("sync_backend.write_text_exact", side_effect=flaky_write_text_exact):
+                result = sync_to_current_provider(paths)
+
+            self.assertEqual(result["updated_session_files"], 1)
+            self.assertEqual(result["skipped_busy_session_files"], 1)
+            self.assertEqual(result["skipped_busy_session_paths"], [str(locked_path)])
+
+            locked_meta = json.loads(locked_path.read_text(encoding="utf-8").splitlines()[0])
+            updated_meta = json.loads(updated_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(locked_meta["payload"]["model_provider"], "custom")
+            self.assertEqual(locked_meta["payload"]["model"], "gpt-5.5")
+            self.assertEqual(updated_meta["payload"]["model_provider"], "openai")
+            self.assertEqual(updated_meta["payload"]["model"], "gpt-5.4")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,12 @@ class SessionRecord:
     model: str | None
 
 
+class FileBusyError(RuntimeError):
+    def __init__(self, target_path: Path):
+        self.target_path = target_path
+        super().__init__(f"File is busy and could not be replaced: {target_path}")
+
+
 def resolve_paths(codex_home: str | None) -> Paths:
     home = Path(codex_home).expanduser() if codex_home else default_codex_home()
     return Paths(
@@ -85,7 +91,7 @@ def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
         if attempt < FILE_REPLACE_RETRY_LIMIT - 1:
             time.sleep(FILE_REPLACE_RETRY_DELAY_SECONDS)
 
-    raise RuntimeError(f"File is busy and could not be replaced: {target_path}") from last_error
+    raise FileBusyError(target_path) from last_error
 
 
 def write_text_exact(path: Path, text: str) -> None:
@@ -487,6 +493,7 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
     started_at = time.monotonic()
     before_records = scan_session_records(paths)
     updated_session_files = 0
+    skipped_busy_session_files: list[str] = []
 
     for record in before_records:
         model_matches = current_model is None or record.model == current_model
@@ -508,12 +515,18 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
             new_text = new_first_line + ending + remainder
         else:
             new_text = new_first_line
-        write_text_exact(record.path, new_text)
+        try:
+            write_text_exact(record.path, new_text)
+        except FileBusyError:
+            skipped_busy_session_files.append(str(record.path))
+            continue
         updated_session_files += 1
 
     after_records = scan_session_records(paths)
     return {
         "updated_session_files": updated_session_files,
+        "skipped_busy_session_files": len(skipped_busy_session_files),
+        "skipped_busy_session_paths": skipped_busy_session_files,
         "session_before_counts": counts_to_rows(
             ordered_counts([record.model_provider for record in before_records])
         ),
@@ -766,6 +779,8 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
         "synced_fields": db_summary["synced_fields"],
         "updated_rows": db_summary["updated_rows"],
         "updated_session_files": session_summary["updated_session_files"],
+        "skipped_busy_session_files": session_summary["skipped_busy_session_files"],
+        "skipped_busy_session_paths": session_summary["skipped_busy_session_paths"],
         "provider_movable_threads": status_before["provider_movable_threads"],
         "model_movable_threads": status_before["model_movable_threads"],
         "backup_path": str(backup_path),
