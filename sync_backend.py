@@ -34,6 +34,7 @@ class Paths:
     codex_home: Path
     config_path: Path
     db_path: Path
+    db_paths: tuple[Path, ...]
     backup_dir: Path
     session_index_path: Path
     sessions_dir: Path
@@ -45,14 +46,46 @@ class SessionRecord:
     path: Path
     model_provider: str
     model: str | None
+    has_inconsistent_meta: bool = False
+
+
+class FileBusyError(RuntimeError):
+    def __init__(self, target_path: Path):
+        self.target_path = target_path
+        super().__init__(f"File is busy and could not be replaced: {target_path}")
+
+
+def dedupe_paths(paths: list[Path]) -> tuple[Path, ...]:
+    seen: set[str] = set()
+    output: list[Path] = []
+    for path in paths:
+        key = str(path.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(path)
+    return tuple(output)
+
+
+def discover_db_paths(home: Path) -> tuple[Path, ...]:
+    candidates = [
+        home / "sqlite" / "state_5.sqlite",
+        home / "state_5.sqlite",
+    ]
+    existing = [path for path in candidates if path.exists()]
+    if existing:
+        return dedupe_paths(existing)
+    return (home / "state_5.sqlite",)
 
 
 def resolve_paths(codex_home: str | None) -> Paths:
     home = Path(codex_home).expanduser() if codex_home else default_codex_home()
+    db_paths = discover_db_paths(home)
     return Paths(
         codex_home=home,
         config_path=home / "config.toml",
-        db_path=home / "state_5.sqlite",
+        db_path=db_paths[0],
+        db_paths=db_paths,
         backup_dir=home / "history_sync_backups",
         session_index_path=home / "session_index.jsonl",
         sessions_dir=home / "sessions",
@@ -85,7 +118,7 @@ def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
         if attempt < FILE_REPLACE_RETRY_LIMIT - 1:
             time.sleep(FILE_REPLACE_RETRY_DELAY_SECONDS)
 
-    raise RuntimeError(f"File is busy and could not be replaced: {target_path}") from last_error
+    raise FileBusyError(target_path) from last_error
 
 
 def write_text_exact(path: Path, text: str) -> None:
@@ -101,9 +134,13 @@ def write_text_exact(path: Path, text: str) -> None:
 
 def parse_current_provider(config_text: str) -> str:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
-    if not match:
-        raise RuntimeError("Could not find model_provider in config.toml.")
-    return match.group(1)
+    if match:
+        return match.group(1)
+
+    # Newer Codex configs may omit model_provider entirely and rely on the
+    # built-in default provider instead. Official docs currently document
+    # "openai" as that default.
+    return "openai"
 
 
 def parse_current_model(config_text: str) -> str | None:
@@ -137,8 +174,22 @@ def connect_db(
 def ensure_environment(paths: Paths) -> None:
     if not paths.config_path.exists():
         raise RuntimeError(f"Missing config file: {paths.config_path}")
-    if not paths.db_path.exists():
-        raise RuntimeError(f"Missing database file: {paths.db_path}")
+    missing_db_paths = [db_path for db_path in paths.db_paths if not db_path.exists()]
+    if missing_db_paths:
+        raise RuntimeError(f"Missing database file: {missing_db_paths[0]}")
+
+
+def db_copy_backup_path(paths: Paths, primary_backup_path: Path, db_path: Path) -> Path:
+    if db_path == paths.db_path:
+        return primary_backup_path
+
+    try:
+        relative_parent = db_path.relative_to(paths.codex_home).parent
+    except ValueError:
+        relative_parent = db_path.parent
+
+    tag = "-".join(part for part in relative_parent.parts if part) or "root"
+    return primary_backup_path.with_name(f"{primary_backup_path.name}.{tag}")
 
 
 def get_thread_columns(conn: sqlite3.Connection) -> set[str]:
@@ -272,6 +323,10 @@ def split_first_line(text: str) -> tuple[str, str, str]:
     return text, "", ""
 
 
+def split_lines_exact(text: str) -> list[str]:
+    return text.splitlines(keepends=True)
+
+
 def replace_first_line(path: Path, first_line: str) -> None:
     text = read_text_exact(path)
     _, ending, remainder = split_first_line(text)
@@ -282,6 +337,29 @@ def replace_first_line(path: Path, first_line: str) -> None:
     else:
         new_text = first_line + "\n"
     write_text_exact(path, new_text)
+
+
+def replace_specific_lines(path: Path, replacements: dict[int, str]) -> None:
+    text = read_text_exact(path)
+    lines = split_lines_exact(text)
+    if not lines:
+        return
+
+    for line_number, replacement in replacements.items():
+        index = line_number - 1
+        if index < 0 or index >= len(lines):
+            continue
+        original_line = lines[index]
+        ending = ""
+        if original_line.endswith("\r\n"):
+            ending = "\r\n"
+        elif original_line.endswith("\n"):
+            ending = "\n"
+        elif original_line.endswith("\r"):
+            ending = "\r"
+        lines[index] = replacement + ending
+
+    write_text_exact(path, "".join(lines))
 
 
 def session_index_backup_path(backup_path: Path) -> Path:
@@ -298,32 +376,65 @@ def iter_session_paths(paths: Paths) -> list[Path]:
     return sorted(paths.sessions_dir.rglob("rollout-*.jsonl"))
 
 
-def parse_session_record(path: Path) -> SessionRecord | None:
-    if not SESSION_FILENAME_PATTERN.search(path.name):
-        return None
-
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        first_line = handle.readline()
-
-    if not first_line:
-        return None
-
-    item = json.loads(first_line.rstrip("\r\n"))
+def parse_session_meta_item(line: str) -> dict[str, object] | None:
+    item = json.loads(line.rstrip("\r\n"))
     if item.get("type") != "session_meta":
         return None
 
     payload = item.get("payload")
     if not isinstance(payload, dict):
         return None
+    return payload
 
-    thread_id = str(payload.get("id") or "").strip()
+
+def parse_session_record(path: Path) -> SessionRecord | None:
+    if not SESSION_FILENAME_PATTERN.search(path.name):
+        return None
+
+    first_payload: dict[str, object] | None = None
+    has_inconsistent_meta = False
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
+                continue
+            try:
+                payload = parse_session_meta_item(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if payload is None:
+                continue
+
+            if first_payload is None:
+                first_payload = payload
+                continue
+
+            first_provider = str(first_payload.get("model_provider") or "")
+            current_provider = str(payload.get("model_provider") or "")
+            first_model_raw = first_payload.get("model")
+            current_model_raw = payload.get("model")
+            first_model = str(first_model_raw) if first_model_raw else None
+            current_model = str(current_model_raw) if current_model_raw else None
+            if current_provider != first_provider or current_model != first_model:
+                has_inconsistent_meta = True
+
+    if first_payload is None:
+        return None
+
+    thread_id = str(first_payload.get("id") or "").strip()
     if not thread_id:
         return None
 
-    model_provider = str(payload.get("model_provider") or "")
-    raw_model = payload.get("model")
+    model_provider = str(first_payload.get("model_provider") or "")
+    raw_model = first_payload.get("model")
     model = str(raw_model) if raw_model else None
-    return SessionRecord(thread_id=thread_id, path=path, model_provider=model_provider, model=model)
+    return SessionRecord(
+        thread_id=thread_id,
+        path=path,
+        model_provider=model_provider,
+        model=model,
+        has_inconsistent_meta=has_inconsistent_meta,
+    )
 
 
 def scan_session_records(paths: Paths) -> list[SessionRecord]:
@@ -381,11 +492,22 @@ def snapshot_metadata(paths: Paths, backup_path: Path) -> None:
     if paths.session_index_path.exists():
         write_text_exact(session_index_backup_path(backup_path), read_text_exact(paths.session_index_path))
 
-    items: list[dict[str, str]] = []
+    items: list[dict[str, object]] = []
     for path in iter_session_paths(paths):
+        meta_lines: list[dict[str, object]] = []
         with path.open("r", encoding="utf-8", newline="") as handle:
-            first_line = handle.readline().rstrip("\r\n")
-        if not first_line:
+            for line_number, raw_line in enumerate(handle, 1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    payload = parse_session_meta_item(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if payload is None:
+                    continue
+                meta_lines.append({"line_number": line_number, "line": raw_line.rstrip("\r\n")})
+
+        if not meta_lines:
             continue
 
         try:
@@ -393,7 +515,7 @@ def snapshot_metadata(paths: Paths, backup_path: Path) -> None:
         except ValueError:
             relative_path = path
 
-        items.append({"path": str(relative_path), "first_line": first_line})
+        items.append({"path": str(relative_path), "meta_lines": meta_lines})
 
     write_text_exact(
         session_meta_backup_path(backup_path),
@@ -418,8 +540,15 @@ def restore_metadata(paths: Paths, backup_path: Path) -> dict[str, object]:
             path = raw_path if raw_path.is_absolute() else paths.codex_home / raw_path
             if not path.exists():
                 continue
-            # 只恢复首行 session_meta，后面的对话内容保持原文件不动。
-            replace_first_line(path, str(item["first_line"]))
+            replacements = {
+                int(meta_item["line_number"]): str(meta_item["line"])
+                for meta_item in item.get("meta_lines", [])
+            }
+            if not replacements and "first_line" in item:
+                replacements = {1: str(item["first_line"])}
+            if not replacements:
+                continue
+            replace_specific_lines(path, replacements)
             session_files_restored += 1
 
     return {
@@ -483,33 +612,51 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
     started_at = time.monotonic()
     before_records = scan_session_records(paths)
     updated_session_files = 0
+    skipped_busy_session_files: list[str] = []
+    updated_session_meta_lines = 0
 
     for record in before_records:
         model_matches = current_model is None or record.model == current_model
-        if record.model_provider == current_provider and model_matches:
+        if record.model_provider == current_provider and model_matches and not record.has_inconsistent_meta:
             continue
 
-        text = read_text_exact(record.path)
-        first_line, ending, remainder = split_first_line(text)
-        item = json.loads(first_line)
-        payload = item.get("payload")
-        if not isinstance(payload, dict):
-            continue
+        replacements: dict[int, str] = {}
+        with record.path.open("r", encoding="utf-8", newline="") as handle:
+            for line_number, raw_line in enumerate(handle, 1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    item = json.loads(raw_line.rstrip("\r\n"))
+                except json.JSONDecodeError:
+                    continue
+                if item.get("type") != "session_meta":
+                    continue
 
-        payload["model_provider"] = current_provider
-        if current_model:
-            payload["model"] = current_model
-        new_first_line = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-        if ending:
-            new_text = new_first_line + ending + remainder
-        else:
-            new_text = new_first_line
-        write_text_exact(record.path, new_text)
+                payload = item.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                payload["model_provider"] = current_provider
+                if current_model:
+                    payload["model"] = current_model
+                replacements[line_number] = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+
+        if not replacements:
+            continue
+        try:
+            replace_specific_lines(record.path, replacements)
+        except FileBusyError:
+            skipped_busy_session_files.append(str(record.path))
+            continue
         updated_session_files += 1
+        updated_session_meta_lines += len(replacements)
 
     after_records = scan_session_records(paths)
     return {
         "updated_session_files": updated_session_files,
+        "updated_session_meta_lines": updated_session_meta_lines,
+        "skipped_busy_session_files": len(skipped_busy_session_files),
+        "skipped_busy_session_paths": skipped_busy_session_files,
         "session_before_counts": counts_to_rows(
             ordered_counts([record.model_provider for record in before_records])
         ),
@@ -541,122 +688,214 @@ def checkpoint(conn: sqlite3.Connection, mode: str = SYNC_CHECKPOINT_MODE) -> tu
     return int(row[0]), int(row[1]), int(row[2])
 
 
+def collect_db_status(
+    db_path: Path,
+    current_provider: str,
+    current_model: str | None,
+    index_entries: dict[str, dict[str, str]],
+    should_check_index: bool,
+) -> dict[str, object]:
+    with connect_db(db_path, readonly=True) as conn:
+        columns = get_thread_columns(conn)
+        counts = query_provider_counts(conn)
+        model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+        provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
+        cwd_counts = query_cwd_counts(conn) if "cwd" in columns else []
+        total_threads = int(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
+        provider_movable = count_mismatched(conn, "model_provider", current_provider)
+        model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
+        provider_movable_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM threads WHERE model_provider IS NULL OR model_provider <> ?",
+                (current_provider,),
+            )
+        }
+        model_movable_ids: set[str] = set()
+        if "model" in columns and current_model:
+            model_movable_ids = {
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM threads WHERE model IS NULL OR model <> ?",
+                    (current_model,),
+                )
+            }
+        movable_ids = provider_movable_ids | model_movable_ids
+        db_thread_query = "SELECT id FROM threads WHERE archived = 0" if "archived" in columns else "SELECT id FROM threads"
+        thread_ids = {str(row["id"]) for row in conn.execute(db_thread_query)}
+        missing_index_ids = thread_ids - set(index_entries) if should_check_index else set()
+
+    return {
+        "db_path": str(db_path),
+        "provider_counts": counts_to_rows(counts),
+        "model_counts": model_counts_to_rows(model_counts),
+        "provider_model_counts": provider_model_counts,
+        "cwd_counts": cwd_counts,
+        "total_threads": total_threads,
+        "provider_movable_threads": provider_movable,
+        "model_movable_threads": model_movable,
+        "provider_movable_ids": provider_movable_ids,
+        "model_movable_ids": model_movable_ids,
+        "movable_ids": movable_ids,
+        "thread_ids": thread_ids,
+        "missing_index_ids": missing_index_ids,
+    }
+
+
 def update_provider_assignments(
     paths: Paths,
     current_provider: str,
     current_model: str | None,
 ) -> dict[str, object]:
     started_at = time.monotonic()
-    last_error: sqlite3.OperationalError | None = None
+    db_summaries: list[dict[str, object]] = []
 
-    for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
-        try:
-            with connect_db(
-                paths.db_path,
-                readonly=False,
-                timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
-            ) as conn:
-                # 显式拿写锁，把等待控制在我们自己的重试节奏里。
-                conn.execute("BEGIN IMMEDIATE")
-                columns = get_thread_columns(conn)
-                before_counts = query_provider_counts(conn)
-                before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
-                set_parts = ["model_provider = ?"]
-                set_params = [current_provider]
-                where_parts = ["model_provider IS NULL OR model_provider <> ?"]
-                where_params = [current_provider]
-                synced_fields = ["model_provider"]
+    for db_path in paths.db_paths:
+        last_error: sqlite3.OperationalError | None = None
 
-                if "model" in columns and current_model:
-                    set_parts.append("model = ?")
-                    set_params.append(current_model)
-                    where_parts.append("model IS NULL OR model <> ?")
-                    where_params.append(current_model)
-                    synced_fields.append("model")
+        for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
+            try:
+                with connect_db(
+                    db_path,
+                    readonly=False,
+                    timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
+                ) as conn:
+                    # 显式拿写锁，把等待控制在我们自己的重试节奏里。
+                    conn.execute("BEGIN IMMEDIATE")
+                    columns = get_thread_columns(conn)
+                    before_counts = query_provider_counts(conn)
+                    before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+                    set_parts = ["model_provider = ?"]
+                    set_params = [current_provider]
+                    where_parts = ["model_provider IS NULL OR model_provider <> ?"]
+                    where_params = [current_provider]
+                    synced_fields = ["model_provider"]
 
-                set_sql = ", ".join(set_parts)
-                where_sql = " OR ".join(f"({part})" for part in where_parts)
-                updated_rows = conn.execute(
-                    f"UPDATE threads SET {set_sql} WHERE {where_sql}",
-                    (*set_params, *where_params),
-                ).rowcount
-                conn.commit()
-                after_counts = query_provider_counts(conn)
-                after_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
-                checkpoint_result = checkpoint(conn)
+                    if "model" in columns and current_model:
+                        set_parts.append("model = ?")
+                        set_params.append(current_model)
+                        where_parts.append("model IS NULL OR model <> ?")
+                        where_params.append(current_model)
+                        synced_fields.append("model")
 
-            return {
-                "attempts": attempt,
-                "lock_wait_ms": elapsed_ms(started_at),
-                "synced_fields": synced_fields,
-                "updated_rows": updated_rows,
-                "before_counts": counts_to_rows(before_counts),
-                "after_counts": counts_to_rows(after_counts),
-                "before_model_counts": model_counts_to_rows(before_model_counts),
-                "after_model_counts": model_counts_to_rows(after_model_counts),
-                "checkpoint": {
-                    "mode": SYNC_CHECKPOINT_MODE,
-                    "busy": checkpoint_result[0],
-                    "log_frames": checkpoint_result[1],
-                    "checkpointed_frames": checkpoint_result[2],
-                },
-            }
-        except sqlite3.OperationalError as exc:
-            if not is_locked_error(exc):
-                raise
-            last_error = exc
-            if attempt >= WRITE_LOCK_RETRY_LIMIT:
-                waited_seconds = (time.monotonic() - started_at)
-                raise RuntimeError(
-                    "Codex 当前正在写入本地历史数据库，"
-                    f"已等待 {waited_seconds:.1f} 秒仍未拿到写锁。"
-                    "保持 Codex 开着也可以同步，但请等当前回复、工具调用或自动保存结束后再试一次。"
-                ) from exc
-            time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+                    set_sql = ", ".join(set_parts)
+                    where_sql = " OR ".join(f"({part})" for part in where_parts)
+                    updated_rows = conn.execute(
+                        f"UPDATE threads SET {set_sql} WHERE {where_sql}",
+                        (*set_params, *where_params),
+                    ).rowcount
+                    conn.commit()
+                    after_counts = query_provider_counts(conn)
+                    after_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+                    checkpoint_result = checkpoint(conn)
 
-    raise RuntimeError("Database write lock retry loop ended unexpectedly.") from last_error
+                db_summaries.append(
+                    {
+                        "db_path": str(db_path),
+                        "attempts": attempt,
+                        "synced_fields": synced_fields,
+                        "updated_rows": updated_rows,
+                        "before_counts": counts_to_rows(before_counts),
+                        "after_counts": counts_to_rows(after_counts),
+                        "before_model_counts": model_counts_to_rows(before_model_counts),
+                        "after_model_counts": model_counts_to_rows(after_model_counts),
+                        "checkpoint": {
+                            "mode": SYNC_CHECKPOINT_MODE,
+                            "busy": checkpoint_result[0],
+                            "log_frames": checkpoint_result[1],
+                            "checkpointed_frames": checkpoint_result[2],
+                        },
+                    }
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if not is_locked_error(exc):
+                    raise
+                last_error = exc
+                if attempt >= WRITE_LOCK_RETRY_LIMIT:
+                    waited_seconds = (time.monotonic() - started_at)
+                    raise RuntimeError(
+                        "Codex 当前正在写入本地历史数据库，"
+                        f"已等待 {waited_seconds:.1f} 秒仍未拿到写锁。"
+                        "保持 Codex 开着也可以同步，但请等当前回复、工具调用或自动保存结束后再试一次。"
+                    ) from exc
+                time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+        else:
+            raise RuntimeError("Database write lock retry loop ended unexpectedly.") from last_error
+
+    primary_summary = db_summaries[0]
+    return {
+        "attempts": max(int(summary["attempts"]) for summary in db_summaries),
+        "lock_wait_ms": elapsed_ms(started_at),
+        "synced_fields": primary_summary["synced_fields"],
+        "updated_rows": sum(int(summary["updated_rows"]) for summary in db_summaries),
+        "before_counts": primary_summary["before_counts"],
+        "after_counts": primary_summary["after_counts"],
+        "before_model_counts": primary_summary["before_model_counts"],
+        "after_model_counts": primary_summary["after_model_counts"],
+        "checkpoint": primary_summary["checkpoint"],
+        "database_copies": db_summaries,
+    }
 
 
 def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, object]:
     started_at = time.monotonic()
-    last_error: sqlite3.OperationalError | None = None
+    db_summaries: list[dict[str, object]] = []
 
-    for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
-        try:
-            with connect_db(chosen_backup, readonly=True) as source, connect_db(
-                paths.db_path,
-                readonly=False,
-                timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
-            ) as target:
-                # SQLite 在整库 backup 到目标库时会自己申请所需锁；
-                # 这里直接尝试 restore，失败后统一按“数据库正忙”重试即可。
-                source.backup(target)
-                checkpoint_result = checkpoint(target)
+    for db_path in paths.db_paths:
+        chosen_db_backup = db_copy_backup_path(paths, chosen_backup, db_path)
+        if db_path != paths.db_path and not chosen_db_backup.exists():
+            chosen_db_backup = chosen_backup
 
-            return {
-                "attempts": attempt,
-                "lock_wait_ms": elapsed_ms(started_at),
-                "checkpoint": {
-                    "mode": SYNC_CHECKPOINT_MODE,
-                    "busy": checkpoint_result[0],
-                    "log_frames": checkpoint_result[1],
-                    "checkpointed_frames": checkpoint_result[2],
-                },
-            }
-        except sqlite3.OperationalError as exc:
-            if not is_locked_error(exc):
-                raise
-            last_error = exc
-            if attempt >= WRITE_LOCK_RETRY_LIMIT:
-                waited_seconds = (time.monotonic() - started_at)
-                raise RuntimeError(
-                    "Codex 当前正在写入本地历史数据库，"
-                    f"已等待 {waited_seconds:.1f} 秒仍无法完成还原。"
-                    "请等当前回复、工具调用或自动保存结束后再试一次。"
-                ) from exc
-            time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
+            try:
+                with connect_db(chosen_db_backup, readonly=True) as source, connect_db(
+                    db_path,
+                    readonly=False,
+                    timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
+                ) as target:
+                    # SQLite 在整库 backup 到目标库时会自己申请所需锁；
+                    # 这里直接尝试 restore，失败后统一按“数据库正忙”重试即可。
+                    source.backup(target)
+                    checkpoint_result = checkpoint(target)
 
-    raise RuntimeError("Database restore retry loop ended unexpectedly.") from last_error
+                db_summaries.append(
+                    {
+                        "db_path": str(db_path),
+                        "restored_from": str(chosen_db_backup),
+                        "attempts": attempt,
+                        "checkpoint": {
+                            "mode": SYNC_CHECKPOINT_MODE,
+                            "busy": checkpoint_result[0],
+                            "log_frames": checkpoint_result[1],
+                            "checkpointed_frames": checkpoint_result[2],
+                        },
+                    }
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if not is_locked_error(exc):
+                    raise
+                last_error = exc
+                if attempt >= WRITE_LOCK_RETRY_LIMIT:
+                    waited_seconds = (time.monotonic() - started_at)
+                    raise RuntimeError(
+                        "Codex 当前正在写入本地历史数据库，"
+                        f"已等待 {waited_seconds:.1f} 秒仍无法完成还原。"
+                        "请等当前回复、工具调用或自动保存结束后再试一次。"
+                    ) from exc
+                time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+        else:
+            raise RuntimeError("Database restore retry loop ended unexpectedly.") from last_error
+
+    primary_summary = db_summaries[0]
+    return {
+        "attempts": max(int(summary["attempts"]) for summary in db_summaries),
+        "lock_wait_ms": elapsed_ms(started_at),
+        "checkpoint": primary_summary["checkpoint"],
+        "database_copies": db_summaries,
+    }
 
 
 def get_status(paths: Paths) -> dict[str, object]:
@@ -670,57 +909,63 @@ def get_status(paths: Paths) -> dict[str, object]:
     session_movable_ids = {
         record.thread_id
         for record in session_records
-        if record.model_provider != current_provider
+        if record.has_inconsistent_meta
+        or record.model_provider != current_provider
         or (current_model is not None and record.model != current_model)
     }
     should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
     index_entries = read_session_index(paths)
 
-    with connect_db(paths.db_path, readonly=True) as conn:
-        columns = get_thread_columns(conn)
-        counts = query_provider_counts(conn)
-        model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
-        provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
-        cwd_counts = query_cwd_counts(conn) if "cwd" in columns else []
-        total_threads = int(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
-        provider_movable = count_mismatched(conn, "model_provider", current_provider)
-        model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
-        where_parts = ["model_provider IS NULL OR model_provider <> ?"]
-        params: list[str] = [current_provider]
-        if "model" in columns and current_model:
-            where_parts.append("model IS NULL OR model <> ?")
-            params.append(current_model)
-        where_sql = " OR ".join(f"({part})" for part in where_parts)
-        db_movable_ids = {str(row["id"]) for row in conn.execute(f"SELECT id FROM threads WHERE {where_sql}", params)}
-        db_thread_query = "SELECT id FROM threads WHERE archived = 0" if "archived" in columns else "SELECT id FROM threads"
-        db_thread_ids = {str(row["id"]) for row in conn.execute(db_thread_query)}
-        missing_index_ids = db_thread_ids - set(index_entries) if should_check_index else set()
-        sync_candidate_ids = db_movable_ids | session_movable_ids | missing_index_ids
+    db_statuses = [
+        collect_db_status(db_path, current_provider, current_model, index_entries, should_check_index)
+        for db_path in paths.db_paths
+    ]
+    primary_db_status = db_statuses[0]
+    has_model_tracking = any(status["model_movable_threads"] is not None for status in db_statuses)
+    provider_movable_ids = set().union(*(status["provider_movable_ids"] for status in db_statuses))
+    model_movable_ids = set().union(*(status["model_movable_ids"] for status in db_statuses))
+    db_movable_ids = set().union(*(status["movable_ids"] for status in db_statuses))
+    db_thread_ids = set().union(*(status["thread_ids"] for status in db_statuses))
+    missing_index_ids = set().union(*(status["missing_index_ids"] for status in db_statuses))
+    sync_candidate_ids = db_movable_ids | session_movable_ids | missing_index_ids
 
     return {
         "codex_home": str(paths.codex_home),
         "config_path": str(paths.config_path),
         "db_path": str(paths.db_path),
+        "db_paths": [str(db_path) for db_path in paths.db_paths],
         "session_index_path": str(paths.session_index_path),
         "sessions_dir": str(paths.sessions_dir),
         "backup_dir": str(paths.backup_dir),
         "current_provider": current_provider,
         "current_model": current_model,
-        "total_threads": total_threads,
+        "total_threads": primary_db_status["total_threads"],
         "movable_threads": len(sync_candidate_ids),
-        "provider_movable_threads": provider_movable,
-        "model_movable_threads": model_movable,
+        "provider_movable_threads": len(provider_movable_ids),
+        "model_movable_threads": len(model_movable_ids) if has_model_tracking and current_model is not None else None,
         "movable_database_threads": len(db_movable_ids),
         "movable_session_threads": len(session_movable_ids),
         "missing_session_index_entries": len(missing_index_ids),
         "indexed_threads": len(index_entries),
         "session_file_count": len(session_records),
-        "provider_counts": counts_to_rows(counts),
-        "model_counts": model_counts_to_rows(model_counts),
-        "provider_model_counts": provider_model_counts,
-        "cwd_counts": cwd_counts,
+        "provider_counts": primary_db_status["provider_counts"],
+        "model_counts": primary_db_status["model_counts"],
+        "provider_model_counts": primary_db_status["provider_model_counts"],
+        "cwd_counts": primary_db_status["cwd_counts"],
         "session_provider_counts": counts_to_rows(session_provider_counts),
         "session_model_counts": model_counts_to_rows(session_model_counts),
+        "database_copies": [
+            {
+                "db_path": status["db_path"],
+                "total_threads": status["total_threads"],
+                "provider_movable_threads": status["provider_movable_threads"],
+                "model_movable_threads": status["model_movable_threads"],
+                "missing_session_index_entries": len(status["missing_index_ids"]),
+                "provider_counts": status["provider_counts"],
+                "model_counts": status["model_counts"],
+            }
+            for status in db_statuses
+        ],
         "backups": list_backups(paths),
     }
 
@@ -730,10 +975,12 @@ def make_backup(paths: Paths, label: str) -> Path:
     paths.backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_path = paths.backup_dir / f"state_5.sqlite.{label}.{timestamp}.bak"
-    with connect_db(paths.db_path, readonly=True) as source, connect_db(backup_path, readonly=False) as target:
-        source.backup(target)
+    for db_path in paths.db_paths:
+        current_backup_path = db_copy_backup_path(paths, backup_path, db_path)
+        with connect_db(db_path, readonly=True) as source, connect_db(current_backup_path, readonly=False) as target:
+            source.backup(target)
+        current_backup_path.touch()
     snapshot_metadata(paths, backup_path)
-    backup_path.touch()
     return backup_path
 
 
@@ -762,6 +1009,9 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
         "synced_fields": db_summary["synced_fields"],
         "updated_rows": db_summary["updated_rows"],
         "updated_session_files": session_summary["updated_session_files"],
+        "updated_session_meta_lines": session_summary["updated_session_meta_lines"],
+        "skipped_busy_session_files": session_summary["skipped_busy_session_files"],
+        "skipped_busy_session_paths": session_summary["skipped_busy_session_paths"],
         "provider_movable_threads": status_before["provider_movable_threads"],
         "model_movable_threads": status_before["model_movable_threads"],
         "backup_path": str(backup_path),
@@ -774,6 +1024,7 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
         "session_before_model_counts": session_summary["session_before_model_counts"],
         "session_after_model_counts": session_summary["session_after_model_counts"],
         "checkpoint": db_summary["checkpoint"],
+        "database_copies": db_summary["database_copies"],
         "lock_wait_ms": db_summary["lock_wait_ms"],
         "lock_attempts": db_summary["attempts"],
         "rewritten_index_entries": index_summary["rewritten_index_entries"],
@@ -828,6 +1079,7 @@ def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
         "safety_backup": str(restore_snapshot),
         "metadata_restore": restore_summary,
         "checkpoint": restore_db_summary["checkpoint"],
+        "database_copies": restore_db_summary["database_copies"],
         "lock_wait_ms": restore_db_summary["lock_wait_ms"],
         "lock_attempts": restore_db_summary["attempts"],
         "rewritten_index_entries": index_summary["rewritten_index_entries"],

@@ -85,6 +85,7 @@ py -3 -m unittest discover -s tests -v
 - 每次恢复前也会先创建一份安全备份
 - 备份默认保存在 `%USERPROFILE%\\.codex\\history_sync_backups`
 - 新版备份会同时保存 `session_index.jsonl` 和会话文件首行元数据，恢复时会一起还原
+- 如果本机同时存在 `%USERPROFILE%\\.codex\\state_5.sqlite` 和 `%USERPROFILE%\\.codex\\sqlite\\state_5.sqlite`，新版工具会优先处理正在被 Codex Desktop 使用的数据库副本，并同时为两份数据库创建/恢复对应备份
 
 ## 使用建议
 
@@ -92,6 +93,7 @@ py -3 -m unittest discover -s tests -v
 - 恢复备份会覆盖当前状态，最稳妥的做法仍然是在恢复前暂停正在运行的 Codex 任务
 - 如果同步完成后历史列表没有立刻刷新，重开一次 Codex Desktop 即可
 - 新版 Codex 可能还会按当前项目目录显示历史。如果同步后仍然看不到旧对话，先确认是否打开了旧对话原来的项目目录；本工具默认不会批量改写线程的 `cwd` 项目归属。
+- 某些设备上的 Codex Desktop 会把活动历史数据库放到 `%USERPROFILE%\\.codex\\sqlite\\state_5.sqlite`。如果只改根目录下的 `state_5.sqlite`，桌面端可能仍然读不到最新同步结果。
 
 ## 项目文件
 
