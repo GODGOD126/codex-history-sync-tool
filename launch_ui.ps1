@@ -138,6 +138,13 @@ function Set-Busy {
     $progressBar.Visible = $false
     if ($script:LatestState) {
       $statusLabel.Text = Get-FriendlyStatus $script:LatestState
+      if ($script:LatestState.codex_running) {
+        foreach ($button in @($syncButton, $backupButton, $restoreButton, $restoreLatestButton)) {
+          if ($button) {
+            $button.Enabled = $false
+          }
+        }
+      }
     } else {
       $statusLabel.Text = '准备就绪'
     }
@@ -147,8 +154,16 @@ function Set-Busy {
 function Get-FriendlyStatus {
   param($Status)
 
+  if ($Status.codex_running) {
+    return "请先完全退出 Codex：检测到 $($Status.codex_process_count) 个 Codex 相关进程仍在运行。"
+  }
+
+  if ($null -ne $Status.validation_issue_count -and [int]$Status.validation_issue_count -gt 0) {
+    return "需要修复：强校验发现 $($Status.validation_issue_count) 个数据库/索引/左栏状态问题。"
+  }
+
   if ([int]$Status.movable_threads -le 0) {
-    return '一切正常：历史记录已经挂到当前账号/Provider。'
+    return '磁盘数据正常：数据库、侧边栏索引和左栏状态已通过校验。'
   }
 
   $parts = @()
@@ -163,6 +178,12 @@ function Get-FriendlyStatus {
   }
   if ([int]$Status.missing_session_index_entries -gt 0) {
     $parts += "$($Status.missing_session_index_entries) 条侧边栏索引待补回"
+  }
+  if ($null -ne $Status.hidden_user_threads -and [int]$Status.hidden_user_threads -gt 0) {
+    $parts += "$($Status.hidden_user_threads) 条可见性字段待修正"
+  }
+  if ($null -ne $Status.extended_cwd_threads -and [int]$Status.extended_cwd_threads -gt 0) {
+    $parts += "$($Status.extended_cwd_threads) 条工作目录路径待规范化"
   }
   return "需要同步：" + ($parts -join '，') + '。'
 }
@@ -180,10 +201,22 @@ function Apply-State {
 
   $providerLabel.Text = "当前账号/Provider: $($Status.current_provider)"
   $modelLabel.Text = if ($Status.current_model) { "当前模型: $($Status.current_model)    待修正: $($Status.model_movable_threads)" } else { '当前模型: 未读取到' }
-  $summaryLabel.Text = "历史线程: $($Status.total_threads)    会话文件: $($Status.session_file_count)    侧边栏索引: $($Status.indexed_threads)"
-  $repairLabel.Text = "待修复: $($Status.movable_threads)    数据库: $($Status.movable_database_threads)    模型: $($Status.model_movable_threads)    会话文件: $($Status.movable_session_threads)    索引: $($Status.missing_session_index_entries)"
+  $summaryLabel.Text = "历史线程: $($Status.total_threads)    会话文件: $($Status.session_file_count)    侧边栏索引: $($Status.indexed_threads)    Codex进程: $($Status.codex_process_count)"
+  $repairLabel.Text = "待修复: $($Status.movable_threads)    数据库: $($Status.movable_database_threads)    模型: $($Status.model_movable_threads)    会话文件: $($Status.movable_session_threads)    索引: $($Status.missing_session_index_entries)    校验: $($Status.validation_issue_count)    左栏状态: $($Status.stale_projectless_entries)    项目根: $($Status.missing_project_roots)    可见性: $($Status.hidden_user_threads)    路径: $($Status.extended_cwd_threads)"
   $pathLabel.Text = "数据位置: $($Status.codex_home)"
   $statusLabel.Text = Get-FriendlyStatus $Status
+  $statusLabel.ForeColor = if ($Status.codex_running -or ([int]$Status.validation_issue_count -gt 0)) {
+    [System.Drawing.Color]::FromArgb(180, 66, 55)
+  } else {
+    [System.Drawing.Color]::FromArgb(28, 84, 160)
+  }
+
+  $writeButtonsEnabled = -not [bool]$Status.codex_running
+  foreach ($button in @($syncButton, $backupButton, $restoreButton, $restoreLatestButton)) {
+    if ($button) {
+      $button.Enabled = $writeButtonsEnabled
+    }
+  }
 
   $providersView.Items.Clear()
   foreach ($row in $Status.provider_counts) {
@@ -244,7 +277,7 @@ $headerLabel.Location = New-Object System.Drawing.Point(24, 18)
 $form.Controls.Add($headerLabel)
 
 $introLabel = New-Object System.Windows.Forms.Label
-$introLabel.Text = '用于把“换了 API / Provider / 登录方式后看不见的本地历史”重新挂回当前 Codex。Codex 开着也可以试，工具会等待数据库空闲。'
+$introLabel.Text = '用于把“换了 API / Provider / 登录方式后看不见的本地历史”重新挂回当前 Codex。执行同步/恢复前必须完全退出 Codex，包括托盘图标。'
 $introLabel.ForeColor = [System.Drawing.Color]::FromArgb(77, 89, 105)
 $introLabel.AutoSize = $true
 $introLabel.MaximumSize = New-Object System.Drawing.Size(850, 0)
