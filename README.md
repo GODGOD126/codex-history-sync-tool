@@ -12,7 +12,7 @@
 - Codex Desktop 正在运行时也可以同步；如果本地数据库正在写入，工具会等待空闲后继续
 - 在同步前自动备份数据库、侧边栏索引和会话元数据
 - 从备份恢复数据库
-- 提供一个可直接点击的 Windows 图形界面
+- 提供可直接点击的 Windows 和 macOS 图形界面
 
 ## 适用场景
 
@@ -28,7 +28,26 @@
 - 本地历史文件已经被删除
 - 不同电脑之间迁移聊天记录
 
-## 运行环境
+## macOS 快速使用
+
+1. 首次在访达中双击 `启动历史同步工具.command`，它会生成并打开 `Codex 历史同步工具.app`
+2. 后续可以直接双击 `Codex 历史同步工具.app`
+3. 首次打开如果被系统拦截，请在文件上右键选择“打开”
+4. 检查界面显示的当前 provider、model 和待整理数量后，点击“同步到当前配置”
+
+也可以在终端运行：
+
+```bash
+./启动历史同步工具.command
+```
+
+macOS 版使用系统原生 AppKit 界面，无需安装第三方 Python 依赖。首次启动需要 Apple
+Command Line Tools 提供的 Swift 编译器；如果尚未安装，可先运行 `xcode-select --install`。
+Intel Mac 最低支持 macOS 10.15，Apple Silicon 最低支持 macOS 11。工具会自动识别
+`~/.codex/state_5.sqlite` 与 `~/.codex/sqlite/state_5.sqlite` 中较新的活动数据库，
+并同时处理 `sessions` 和 `archived_sessions` 下的会话文件。
+
+## Windows 运行环境
 
 - Windows
 - PowerShell 5.1 或更高版本
@@ -97,6 +116,8 @@ py -3 -m unittest discover -s tests -v
 
 - `sync_backend.py`：后端同步、备份、恢复逻辑
 - `launch_ui.ps1`：Windows 图形界面
+- `launch_ui_macos.swift`：macOS 原生图形界面
+- `启动历史同步工具.command`：macOS 双击启动入口
 
 ## 免责声明
 

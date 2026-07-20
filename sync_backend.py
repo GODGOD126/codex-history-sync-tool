@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 SESSION_FILENAME_PATTERN = re.compile(
     r"rollout-.*-(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
@@ -37,6 +38,7 @@ class Paths:
     backup_dir: Path
     session_index_path: Path
     sessions_dir: Path
+    archived_sessions_dir: Path
 
 
 @dataclass
@@ -44,32 +46,41 @@ class SessionRecord:
     thread_id: str
     path: Path
     model_provider: str
-    model: str | None
+    model: Optional[str]
 
 
-def resolve_paths(codex_home: str | None) -> Paths:
+def find_active_database(home: Path) -> Path:
+    candidates = [home / "state_5.sqlite", home / "sqlite" / "state_5.sqlite"]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return candidates[0]
+    return max(existing, key=lambda path: path.stat().st_mtime_ns)
+
+
+def resolve_paths(codex_home: Optional[str]) -> Paths:
     home = Path(codex_home).expanduser() if codex_home else default_codex_home()
     return Paths(
         codex_home=home,
         config_path=home / "config.toml",
-        db_path=home / "state_5.sqlite",
+        db_path=find_active_database(home),
         backup_dir=home / "history_sync_backups",
         session_index_path=home / "session_index.jsonl",
         sessions_dir=home / "sessions",
+        archived_sessions_dir=home / "archived_sessions",
     )
 
 
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8-sig")
 
 
 def read_text_exact(path: Path) -> str:
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return handle.read()
 
 
 def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
-    last_error: OSError | None = None
+    last_error: Optional[OSError] = None
     for attempt in range(FILE_REPLACE_RETRY_LIMIT):
         try:
             # 用原子替换避免写到一半被 Codex 读到半成品文件。
@@ -106,7 +117,7 @@ def parse_current_provider(config_text: str) -> str:
     return match.group(1)
 
 
-def parse_current_model(config_text: str) -> str | None:
+def parse_current_model(config_text: str) -> Optional[str]:
     match = re.search(r'(?m)^\s*model\s*=\s*"([^"]+)"', config_text)
     return match.group(1) if match else None
 
@@ -116,13 +127,28 @@ def connect_db(
     path: Path,
     readonly: bool = False,
     timeout_seconds: float = DEFAULT_DB_TIMEOUT_SECONDS,
-    busy_timeout_ms: int | None = None,
+    busy_timeout_ms: Optional[int] = None,
 ) -> Iterator[sqlite3.Connection]:
     if busy_timeout_ms is None:
         busy_timeout_ms = max(1, int(timeout_seconds * 1000))
 
+    conn: Optional[sqlite3.Connection] = None
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout_seconds)
+        database_uri = path.resolve().as_uri()
+        try:
+            conn = sqlite3.connect(f"{database_uri}?mode=ro", uri=True, timeout=timeout_seconds)
+            conn.execute("PRAGMA schema_version").fetchone()
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.close()
+            if "unable to open database file" not in str(exc).lower():
+                raise
+
+            # WAL 数据库的只读连接在部分 macOS/Python 组合下无法正常打开
+            # -shm 文件。mode=rw 不会创建数据库，query_only 则继续保证此连接只读。
+            conn = sqlite3.connect(f"{database_uri}?mode=rw", uri=True, timeout=timeout_seconds)
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA schema_version").fetchone()
     else:
         conn = sqlite3.connect(str(path), timeout=timeout_seconds)
 
@@ -132,6 +158,15 @@ def connect_db(
         yield conn
     finally:
         conn.close()
+
+
+def user_facing_error(paths: Paths, exc: Exception) -> str:
+    if isinstance(exc, sqlite3.OperationalError) and "unable to open database file" in str(exc).lower():
+        return (
+            f"无法打开 Codex 历史数据库：{paths.db_path}\n"
+            "请确认数据库文件仍然存在，并且当前用户对该文件及其所在目录有读写权限。"
+        )
+    return str(exc)
 
 
 def ensure_environment(paths: Paths) -> None:
@@ -233,7 +268,7 @@ def query_cwd_counts(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str
     return rows
 
 
-def count_mismatched(conn: sqlite3.Connection, column: str, expected: str | None) -> int | None:
+def count_mismatched(conn: sqlite3.Connection, column: str, expected: Optional[str]) -> Optional[int]:
     if expected is None:
         return None
     return int(
@@ -293,16 +328,18 @@ def session_meta_backup_path(backup_path: Path) -> Path:
 
 
 def iter_session_paths(paths: Paths) -> list[Path]:
-    if not paths.sessions_dir.exists():
-        return []
-    return sorted(paths.sessions_dir.rglob("rollout-*.jsonl"))
+    files: list[Path] = []
+    for directory in (paths.sessions_dir, paths.archived_sessions_dir):
+        if directory.exists():
+            files.extend(directory.rglob("rollout-*.jsonl"))
+    return sorted(files)
 
 
-def parse_session_record(path: Path) -> SessionRecord | None:
+def parse_session_record(path: Path) -> Optional[SessionRecord]:
     if not SESSION_FILENAME_PATTERN.search(path.name):
         return None
 
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
         first_line = handle.readline()
 
     if not first_line:
@@ -329,9 +366,12 @@ def parse_session_record(path: Path) -> SessionRecord | None:
 def scan_session_records(paths: Paths) -> list[SessionRecord]:
     records: list[SessionRecord] = []
     for path in iter_session_paths(paths):
-        record = parse_session_record(path)
-        if record:
-            records.append(record)
+        try:
+            record = parse_session_record(path)
+            if record:
+                records.append(record)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
     return records
 
 
@@ -479,7 +519,7 @@ def rebuild_session_index(paths: Paths, conn: sqlite3.Connection) -> dict[str, i
     }
 
 
-def sync_session_records(paths: Paths, current_provider: str, current_model: str | None) -> dict[str, object]:
+def sync_session_records(paths: Paths, current_provider: str, current_model: Optional[str]) -> dict[str, object]:
     started_at = time.monotonic()
     before_records = scan_session_records(paths)
     updated_session_files = 0
@@ -544,10 +584,10 @@ def checkpoint(conn: sqlite3.Connection, mode: str = SYNC_CHECKPOINT_MODE) -> tu
 def update_provider_assignments(
     paths: Paths,
     current_provider: str,
-    current_model: str | None,
+    current_model: Optional[str],
 ) -> dict[str, object]:
     started_at = time.monotonic()
-    last_error: sqlite3.OperationalError | None = None
+    last_error: Optional[sqlite3.OperationalError] = None
 
     for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
         try:
@@ -619,7 +659,7 @@ def update_provider_assignments(
 
 def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, object]:
     started_at = time.monotonic()
-    last_error: sqlite3.OperationalError | None = None
+    last_error: Optional[sqlite3.OperationalError] = None
 
     for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
         try:
@@ -790,7 +830,7 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
     }
 
 
-def resolve_backup(paths: Paths, requested_path: str | None) -> Path:
+def resolve_backup(paths: Paths, requested_path: Optional[str]) -> Path:
     if requested_path:
         backup = Path(requested_path).expanduser()
     else:
@@ -803,7 +843,7 @@ def resolve_backup(paths: Paths, requested_path: str | None) -> Path:
     return backup
 
 
-def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
+def restore_backup(paths: Paths, backup_path: Optional[str]) -> dict[str, object]:
     total_started_at = time.monotonic()
     ensure_environment(paths)
     chosen_backup = resolve_backup(paths, backup_path)
@@ -879,7 +919,7 @@ def main() -> int:
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except Exception as exc:
-        error_payload = {"ok": False, "error": str(exc)}
+        error_payload = {"ok": False, "error": user_facing_error(paths, exc)}
         if args.json:
             print(to_json(error_payload))
         else:
