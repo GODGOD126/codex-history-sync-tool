@@ -5,8 +5,17 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 
-from sync_backend import get_status, make_backup, resolve_paths, restore_backup, sync_to_current_provider
+from sync_backend import (
+    connect_db,
+    find_active_database,
+    get_status,
+    make_backup,
+    resolve_paths,
+    restore_backup,
+    sync_to_current_provider,
+)
 
 
 def write_config(codex_home, provider: str = "new_provider", model: str = "gpt-new") -> None:
@@ -42,6 +51,46 @@ def create_threads_db(codex_home, *, with_model: bool = True) -> None:
 
 
 class SyncBackendTests(unittest.TestCase):
+    def test_readonly_connection_falls_back_to_query_only_rw_for_wal_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "state_5.sqlite"
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+                conn.execute("INSERT INTO threads (id) VALUES ('existing')")
+                conn.commit()
+
+            real_connect = sqlite3.connect
+            opened_uris: list[str] = []
+
+            def connect_with_readonly_failure(database, *args, **kwargs):
+                opened_uris.append(str(database))
+                if "mode=ro" in str(database):
+                    raise sqlite3.OperationalError("unable to open database file")
+                return real_connect(database, *args, **kwargs)
+
+            with mock.patch("sync_backend.sqlite3.connect", side_effect=connect_with_readonly_failure):
+                with connect_db(db_path, readonly=True) as conn:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 1)
+                    with self.assertRaises(sqlite3.OperationalError):
+                        conn.execute("INSERT INTO threads (id) VALUES ('blocked')")
+
+            self.assertIn("mode=ro", opened_uris[0])
+            self.assertIn("mode=rw", opened_uris[1])
+
+    def test_resolve_paths_uses_the_newest_database_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            sqlite_dir = codex_home / "sqlite"
+            sqlite_dir.mkdir()
+            root_db = codex_home / "state_5.sqlite"
+            nested_db = sqlite_dir / "state_5.sqlite"
+            root_db.touch()
+            nested_db.touch()
+            root_db.touch()
+
+            self.assertEqual(find_active_database(codex_home), root_db)
+            self.assertEqual(resolve_paths(str(codex_home)).db_path, root_db)
+
     def test_sync_updates_provider_and_model_for_newer_codex_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir)
