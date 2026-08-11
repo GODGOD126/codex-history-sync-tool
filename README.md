@@ -9,6 +9,7 @@
 - 查看当前本机 Codex 历史线程属于哪些 provider
 - 查看当前本机 Codex 历史线程属于哪些 model
 - 一键把旧 provider / model 下的线程、会话元数据和侧边栏索引同步到当前设置
+- 自动识别根目录或 `sqlite` 子目录中最近仍有活动的 Codex 状态数据库
 - Codex Desktop 正在运行时也可以同步；如果本地数据库正在写入，工具会等待空闲后继续
 - 在同步前自动备份数据库、侧边栏索引和会话元数据
 - 从备份恢复数据库
@@ -61,6 +62,15 @@ py -3 .\sync_backend.py --json status
 py -3 .\sync_backend.py --json sync
 ```
 
+新版官方配置可能不再写入 `model_provider`。此时工具会安全地使用官方默认值 `openai`，不会从旧历史记录猜测当前账号。如果你使用第三方 Provider，或者自动识别结果不符合实际，可以手动指定目标：
+
+```powershell
+py -3 .\sync_backend.py --json sync --provider openai
+py -3 .\sync_backend.py --json sync --provider your-provider --model your-model
+```
+
+`--model` 留空时，如果 `config.toml` 里也没有 `model`，工具只修正 Provider，不会批量改写已有线程的模型。
+
 ### 手动创建备份
 
 ```powershell
@@ -86,6 +96,15 @@ py -3 -m unittest discover -s tests -v
 - 备份默认保存在 `%USERPROFILE%\\.codex\\history_sync_backups`
 - 新版备份会同时保存 `session_index.jsonl` 和会话文件首行元数据，恢复时会一起还原
 
+## 状态数据库选择
+
+Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
+
+- `%USERPROFILE%\.codex\state_5.sqlite`
+- `%USERPROFILE%\.codex\sqlite\state_5.sqlite`
+
+如果两个文件同时存在，工具会比较数据库本体和对应 `-wal` 文件的最近活动时间，选择实际仍在写入的那个；时间相同时优先根目录版本。工具不会仅因为 `sqlite` 子目录存在就使用其中可能已经过期的副本。
+
 ## 使用建议
 
 - Codex Desktop 开着也可以同步；如果它正在生成回复或保存历史，工具可能会等待几秒
@@ -97,6 +116,7 @@ py -3 -m unittest discover -s tests -v
 
 - `sync_backend.py`：后端同步、备份、恢复逻辑
 - `launch_ui.ps1`：Windows 图形界面
+- `CHANGELOG.md`：正式版本变更记录
 
 ## 免责声明
 

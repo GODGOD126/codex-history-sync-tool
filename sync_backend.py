@@ -24,11 +24,6 @@ FILE_REPLACE_RETRY_LIMIT = 20
 FILE_REPLACE_RETRY_DELAY_SECONDS = 0.1
 SYNC_CHECKPOINT_MODE = "PASSIVE"
 
-KNOWN_MARKETPLACE_PROVIDERS = {
-    "openai": "OpenAI",
-    "anthropic": "Anthropic",
-}
-
 
 def default_codex_home() -> Path:
     return Path.home() / ".codex"
@@ -52,13 +47,33 @@ class SessionRecord:
     model: str | None
 
 
+def database_activity_ns(path: Path) -> int:
+    """Return the newest activity timestamp for a SQLite database and its WAL."""
+    activity = 0
+    for candidate in (path, Path(f"{path}-wal")):
+        try:
+            activity = max(activity, candidate.stat().st_mtime_ns)
+        except FileNotFoundError:
+            continue
+    return activity
+
+
 def resolve_paths(codex_home: str | None) -> Paths:
     home = Path(codex_home).expanduser() if codex_home else default_codex_home()
+    legacy_db_path = home / "state_5.sqlite"
     modern_db_path = home / "sqlite" / "state_5.sqlite"
+    existing_db_paths = [path for path in (legacy_db_path, modern_db_path) if path.exists()]
+    if existing_db_paths:
+        db_path = max(
+            existing_db_paths,
+            key=lambda path: (database_activity_ns(path), path == legacy_db_path),
+        )
+    else:
+        db_path = legacy_db_path
     return Paths(
         codex_home=home,
         config_path=home / "config.toml",
-        db_path=modern_db_path if modern_db_path.exists() else home / "state_5.sqlite",
+        db_path=db_path,
         backup_dir=home / "history_sync_backups",
         session_index_path=home / "session_index.jsonl",
         sessions_dir=home / "sessions",
@@ -105,55 +120,19 @@ def write_text_exact(path: Path, text: str) -> None:
             temp_path.unlink()
 
 
-def parse_provider_from_marketplaces(config_text: str) -> str | None:
-    """从新版 Codex 的 [marketplaces.xxx] 配置推断当前 provider。"""
-    matches = re.findall(r"\[marketplaces\.([^\]]+)\]", config_text)
-    for marketplace in matches:
-        prefix = marketplace.split("-")[0].lower()
-        if prefix in KNOWN_MARKETPLACE_PROVIDERS:
-            return KNOWN_MARKETPLACE_PROVIDERS[prefix]
-    return None
-
-
-def infer_provider_from_database(paths: "Paths") -> str | None:
-    """兜底：用数据库里最新线程的 provider 作为当前 provider。"""
-    if not paths.db_path.exists():
-        return None
-    with connect_db(paths.db_path, readonly=True) as conn:
-        row = conn.execute(
-            "SELECT model_provider FROM threads ORDER BY rowid DESC LIMIT 1"
-        ).fetchone()
-    return str(row["model_provider"]) if row else None
-
-
 def parse_current_provider(config_text: str, paths: "Paths | None" = None) -> str:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
     if match:
         return match.group(1)
-
-    if paths is not None:
-        provider = infer_provider_from_database(paths)
-        if provider:
-            return provider
-
-    provider = parse_provider_from_marketplaces(config_text)
-    if provider:
-        return provider
-
-    raise RuntimeError("Could not find model_provider in config.toml.")
+    # 新版官方配置可能省略 model_provider。旧线程数据库只代表历史值，
+    # 不能安全地反推出当前 Provider，因此使用官方默认值 openai。
+    return "openai"
 
 
 def parse_current_model(config_text: str, paths: "Paths | None" = None) -> str | None:
     match = re.search(r'(?m)^\s*model\s*=\s*"([^"]+)"', config_text)
     if match:
         return match.group(1)
-    if paths is not None and paths.db_path.exists():
-        with connect_db(paths.db_path, readonly=True) as conn:
-            row = conn.execute(
-                "SELECT model FROM threads WHERE model IS NOT NULL GROUP BY model ORDER BY COUNT(*) DESC LIMIT 1"
-            ).fetchone()
-        if row:
-            return str(row["model"])
     return None
 
 
@@ -789,15 +768,20 @@ def make_backup(paths: Paths, label: str) -> Path:
     return backup_path
 
 
-def sync_to_current_provider(paths: Paths, provider_override: str | None = None, model_override: str | None = None) -> dict[str, object]:
+def sync_to_current_provider(
+    paths: Paths,
+    provider_override: str | None = None,
+    model_override: str | None = None,
+) -> dict[str, object]:
     total_started_at = time.monotonic()
-    status_before = get_status(paths, provider_override=provider_override)
+    status_before = get_status(
+        paths,
+        provider_override=provider_override,
+        model_override=model_override,
+    )
     current_provider = str(status_before["current_provider"])
-    # model 优先级：CLI/UI 显式指定 > config.toml 旧格式 > 不改（留空）
-    if model_override:
-        current_model = model_override
-    else:
-        current_model = parse_current_model(read_text(paths.config_path))
+    current_model_value = status_before["current_model"]
+    current_model = str(current_model_value) if current_model_value is not None else None
 
     backup_started_at = time.monotonic()
     backup_path = make_backup(paths, "pre-sync")
@@ -809,7 +793,11 @@ def sync_to_current_provider(paths: Paths, provider_override: str | None = None,
     with connect_db(paths.db_path, readonly=True) as conn:
         index_summary = rebuild_session_index(paths, conn)
 
-    status_after = get_status(paths)
+    status_after = get_status(
+        paths,
+        provider_override=provider_override,
+        model_override=model_override,
+    )
     return {
         "action": "sync",
         "current_provider": current_provider,
@@ -898,7 +886,7 @@ def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
 
 
 def to_json(payload: dict[str, object]) -> str:
-    return json.dumps(payload, ensure_ascii=True, indent=2)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def main() -> int:
