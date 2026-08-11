@@ -54,10 +54,11 @@ class SessionRecord:
 
 def resolve_paths(codex_home: str | None) -> Paths:
     home = Path(codex_home).expanduser() if codex_home else default_codex_home()
+    modern_db_path = home / "sqlite" / "state_5.sqlite"
     return Paths(
         codex_home=home,
         config_path=home / "config.toml",
-        db_path=home / "state_5.sqlite",
+        db_path=modern_db_path if modern_db_path.exists() else home / "state_5.sqlite",
         backup_dir=home / "history_sync_backups",
         session_index_path=home / "session_index.jsonl",
         sessions_dir=home / "sessions",
@@ -380,6 +381,10 @@ def scan_session_records(paths: Paths) -> list[SessionRecord]:
     return records
 
 
+def session_model_matches(record: SessionRecord, current_model: str | None) -> bool:
+    return current_model is None or record.model is None or record.model == current_model
+
+
 def read_session_index(paths: Paths) -> OrderedDict[str, dict[str, str]]:
     entries: OrderedDict[str, dict[str, str]] = OrderedDict()
     if not paths.session_index_path.exists():
@@ -533,8 +538,7 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
     updated_session_files = 0
 
     for record in before_records:
-        model_matches = current_model is None or record.model == current_model
-        if record.model_provider == current_provider and model_matches:
+        if record.model_provider == current_provider and session_model_matches(record, current_model):
             continue
 
         text = read_text_exact(record.path)
@@ -545,7 +549,7 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
             continue
 
         payload["model_provider"] = current_provider
-        if current_model:
+        if current_model and record.model is not None:
             payload["model"] = current_model
         new_first_line = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
         if ending:
@@ -719,7 +723,7 @@ def get_status(paths: Paths, provider_override: str | None = None, model_overrid
         record.thread_id
         for record in session_records
         if record.model_provider != current_provider
-        or (current_model is not None and record.model != current_model)
+        or not session_model_matches(record, current_model)
     }
     should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
     index_entries = read_session_index(paths)
@@ -894,7 +898,7 @@ def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
 
 
 def to_json(payload: dict[str, object]) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return json.dumps(payload, ensure_ascii=True, indent=2)
 
 
 def main() -> int:
