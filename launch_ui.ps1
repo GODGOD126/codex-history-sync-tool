@@ -167,8 +167,22 @@ function Get-FriendlyStatus {
   return "需要同步：" + ($parts -join '，') + '。'
 }
 
+function Build-BackendArgs {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Command
+  )
+
+  $args = @('--json', $Command)
+  $provider = $script:ProviderOverrideBox.Text.Trim()
+  $model = $script:ModelOverrideBox.Text.Trim()
+  if ($provider) { $args += @('--provider', $provider) }
+  if ($model) { $args += @('--model', $model) }
+  return $args
+}
+
 function Refresh-State {
-  $status = Invoke-Backend @('--json', 'status')
+  $status = Invoke-Backend (Build-BackendArgs 'status')
   Apply-State $status
   Append-Log "状态已刷新：$(Get-FriendlyStatus $status)"
 }
@@ -231,8 +245,8 @@ function Confirm-Action {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Codex 历史找回助手'
 $form.StartPosition = 'CenterScreen'
-$form.Size = New-Object System.Drawing.Size(920, 700)
-$form.MinimumSize = New-Object System.Drawing.Size(920, 700)
+$form.Size = New-Object System.Drawing.Size(920, 740)
+$form.MinimumSize = New-Object System.Drawing.Size(920, 740)
 $form.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 251)
 $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 
@@ -297,16 +311,46 @@ $pathLabel.Location = New-Object System.Drawing.Point(28, 246)
 $pathLabel.MaximumSize = New-Object System.Drawing.Size(840, 0)
 $form.Controls.Add($pathLabel)
 
+# 手动指定 provider / model 的输入框
+$overrideInfoLabel = New-Object System.Windows.Forms.Label
+$overrideInfoLabel.Text = '手动指定目标 (留空则自动检测):'
+$overrideInfoLabel.AutoSize = $true
+$overrideInfoLabel.ForeColor = [System.Drawing.Color]::FromArgb(77, 89, 105)
+$overrideInfoLabel.Location = New-Object System.Drawing.Point(28, 274)
+$form.Controls.Add($overrideInfoLabel)
+
+$providerOverrideLabel = New-Object System.Windows.Forms.Label
+$providerOverrideLabel.Text = 'Provider:'
+$providerOverrideLabel.AutoSize = $true
+$providerOverrideLabel.Location = New-Object System.Drawing.Point(28, 298)
+$form.Controls.Add($providerOverrideLabel)
+
+$script:ProviderOverrideBox = New-Object System.Windows.Forms.TextBox
+$script:ProviderOverrideBox.Location = New-Object System.Drawing.Point(98, 295)
+$script:ProviderOverrideBox.Size = New-Object System.Drawing.Size(180, 23)
+$form.Controls.Add($script:ProviderOverrideBox)
+
+$modelOverrideLabel = New-Object System.Windows.Forms.Label
+$modelOverrideLabel.Text = 'Model:'
+$modelOverrideLabel.AutoSize = $true
+$modelOverrideLabel.Location = New-Object System.Drawing.Point(300, 298)
+$form.Controls.Add($modelOverrideLabel)
+
+$script:ModelOverrideBox = New-Object System.Windows.Forms.TextBox
+$script:ModelOverrideBox.Location = New-Object System.Drawing.Point(352, 295)
+$script:ModelOverrideBox.Size = New-Object System.Drawing.Size(180, 23)
+$form.Controls.Add($script:ModelOverrideBox)
+
 $refreshButton = New-Object System.Windows.Forms.Button
 $refreshButton.Text = '重新检查'
 $refreshButton.Size = New-Object System.Drawing.Size(110, 36)
-$refreshButton.Location = New-Object System.Drawing.Point(28, 286)
+$refreshButton.Location = New-Object System.Drawing.Point(28, 336)
 $form.Controls.Add($refreshButton)
 
 $syncButton = New-Object System.Windows.Forms.Button
 $syncButton.Text = '开始找回历史'
 $syncButton.Size = New-Object System.Drawing.Size(150, 36)
-$syncButton.Location = New-Object System.Drawing.Point(150, 286)
+$syncButton.Location = New-Object System.Drawing.Point(150, 336)
 $syncButton.BackColor = [System.Drawing.Color]::FromArgb(32, 91, 177)
 $syncButton.ForeColor = [System.Drawing.Color]::White
 $syncButton.FlatStyle = 'Flat'
@@ -315,24 +359,24 @@ $form.Controls.Add($syncButton)
 $backupButton = New-Object System.Windows.Forms.Button
 $backupButton.Text = '先做备份'
 $backupButton.Size = New-Object System.Drawing.Size(110, 36)
-$backupButton.Location = New-Object System.Drawing.Point(316, 286)
+$backupButton.Location = New-Object System.Drawing.Point(316, 336)
 $form.Controls.Add($backupButton)
 
 $openBackupsButton = New-Object System.Windows.Forms.Button
 $openBackupsButton.Text = '打开备份'
 $openBackupsButton.Size = New-Object System.Drawing.Size(110, 36)
-$openBackupsButton.Location = New-Object System.Drawing.Point(438, 286)
+$openBackupsButton.Location = New-Object System.Drawing.Point(438, 336)
 $form.Controls.Add($openBackupsButton)
 
 $shortcutButton = New-Object System.Windows.Forms.Button
 $shortcutButton.Text = '更新桌面入口'
 $shortcutButton.Size = New-Object System.Drawing.Size(130, 36)
-$shortcutButton.Location = New-Object System.Drawing.Point(560, 286)
+$shortcutButton.Location = New-Object System.Drawing.Point(560, 336)
 $form.Controls.Add($shortcutButton)
 
 $providersBox = New-Object System.Windows.Forms.GroupBox
 $providersBox.Text = '历史归属'
-$providersBox.Location = New-Object System.Drawing.Point(28, 342)
+$providersBox.Location = New-Object System.Drawing.Point(28, 392)
 $providersBox.Size = New-Object System.Drawing.Size(400, 170)
 $form.Controls.Add($providersBox)
 
@@ -350,7 +394,7 @@ $providersBox.Controls.Add($providersView)
 
 $backupsBox = New-Object System.Windows.Forms.GroupBox
 $backupsBox.Text = '安全备份'
-$backupsBox.Location = New-Object System.Drawing.Point(450, 342)
+$backupsBox.Location = New-Object System.Drawing.Point(450, 392)
 $backupsBox.Size = New-Object System.Drawing.Size(418, 170)
 $form.Controls.Add($backupsBox)
 
@@ -375,7 +419,7 @@ $logBox = New-Object System.Windows.Forms.TextBox
 $logBox.Multiline = $true
 $logBox.ScrollBars = 'Vertical'
 $logBox.ReadOnly = $true
-$logBox.Location = New-Object System.Drawing.Point(28, 530)
+$logBox.Location = New-Object System.Drawing.Point(28, 580)
 $logBox.Size = New-Object System.Drawing.Size(840, 120)
 $logBox.BackColor = [System.Drawing.Color]::White
 $form.Controls.Add($logBox)
@@ -406,7 +450,7 @@ $syncButton.Add_Click({
     }
 
     Set-Busy -Busy $true -Message '正在同步历史，Codex 忙的时候会自动等一会儿...'
-    $result = Invoke-Backend @('--json', 'sync')
+    $result = Invoke-Backend (Build-BackendArgs 'sync')
     Append-Log "同步完成。数据库更新 $($result.updated_rows) 条，会话文件更新 $($result.updated_session_files) 个。"
     Append-Log "等待数据库空闲: $(Format-Duration $result.lock_wait_ms)，总耗时: $(Format-Duration $result.timing.total_ms)。"
     Append-Log "数据库同步前: $(Format-Counts $result.before_counts)"

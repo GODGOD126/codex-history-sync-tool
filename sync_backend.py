@@ -24,6 +24,11 @@ FILE_REPLACE_RETRY_LIMIT = 20
 FILE_REPLACE_RETRY_DELAY_SECONDS = 0.1
 SYNC_CHECKPOINT_MODE = "PASSIVE"
 
+KNOWN_MARKETPLACE_PROVIDERS = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+}
+
 
 def default_codex_home() -> Path:
     return Path.home() / ".codex"
@@ -99,16 +104,56 @@ def write_text_exact(path: Path, text: str) -> None:
             temp_path.unlink()
 
 
-def parse_current_provider(config_text: str) -> str:
+def parse_provider_from_marketplaces(config_text: str) -> str | None:
+    """从新版 Codex 的 [marketplaces.xxx] 配置推断当前 provider。"""
+    matches = re.findall(r"\[marketplaces\.([^\]]+)\]", config_text)
+    for marketplace in matches:
+        prefix = marketplace.split("-")[0].lower()
+        if prefix in KNOWN_MARKETPLACE_PROVIDERS:
+            return KNOWN_MARKETPLACE_PROVIDERS[prefix]
+    return None
+
+
+def infer_provider_from_database(paths: "Paths") -> str | None:
+    """兜底：用数据库里最新线程的 provider 作为当前 provider。"""
+    if not paths.db_path.exists():
+        return None
+    with connect_db(paths.db_path, readonly=True) as conn:
+        row = conn.execute(
+            "SELECT model_provider FROM threads ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    return str(row["model_provider"]) if row else None
+
+
+def parse_current_provider(config_text: str, paths: "Paths | None" = None) -> str:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
-    if not match:
-        raise RuntimeError("Could not find model_provider in config.toml.")
-    return match.group(1)
+    if match:
+        return match.group(1)
+
+    if paths is not None:
+        provider = infer_provider_from_database(paths)
+        if provider:
+            return provider
+
+    provider = parse_provider_from_marketplaces(config_text)
+    if provider:
+        return provider
+
+    raise RuntimeError("Could not find model_provider in config.toml.")
 
 
-def parse_current_model(config_text: str) -> str | None:
+def parse_current_model(config_text: str, paths: "Paths | None" = None) -> str | None:
     match = re.search(r'(?m)^\s*model\s*=\s*"([^"]+)"', config_text)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    if paths is not None and paths.db_path.exists():
+        with connect_db(paths.db_path, readonly=True) as conn:
+            row = conn.execute(
+                "SELECT model FROM threads WHERE model IS NOT NULL GROUP BY model ORDER BY COUNT(*) DESC LIMIT 1"
+            ).fetchone()
+        if row:
+            return str(row["model"])
+    return None
 
 
 @contextmanager
@@ -371,7 +416,10 @@ def parse_index_timestamp(value: str) -> datetime:
     if not value:
         return datetime.fromtimestamp(0, tz=UTC)
     normalized = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(normalized)
+    # Python 3.10/3.11 的 fromisoformat 只接受最多 6 位小数（微秒），
+    # Codex 有时会写出 7 位（100 纳秒级），需要截断。
+    fixed = re.sub(r"(\.\d{1,6})\d+([+-])", r"\1\2", normalized)
+    parsed = datetime.fromisoformat(fixed)
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
@@ -659,11 +707,11 @@ def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, 
     raise RuntimeError("Database restore retry loop ended unexpectedly.") from last_error
 
 
-def get_status(paths: Paths) -> dict[str, object]:
+def get_status(paths: Paths, provider_override: str | None = None, model_override: str | None = None) -> dict[str, object]:
     ensure_environment(paths)
     config_text = read_text(paths.config_path)
-    current_provider = parse_current_provider(config_text)
-    current_model = parse_current_model(config_text)
+    current_provider = provider_override or parse_current_provider(config_text, paths)
+    current_model = model_override or parse_current_model(config_text, paths)
     session_records = scan_session_records(paths)
     session_provider_counts = ordered_counts([record.model_provider for record in session_records])
     session_model_counts = ordered_counts([record.model or "(empty)" for record in session_records])
@@ -737,12 +785,15 @@ def make_backup(paths: Paths, label: str) -> Path:
     return backup_path
 
 
-def sync_to_current_provider(paths: Paths) -> dict[str, object]:
+def sync_to_current_provider(paths: Paths, provider_override: str | None = None, model_override: str | None = None) -> dict[str, object]:
     total_started_at = time.monotonic()
-    status_before = get_status(paths)
+    status_before = get_status(paths, provider_override=provider_override)
     current_provider = str(status_before["current_provider"])
-    raw_current_model = status_before.get("current_model")
-    current_model = str(raw_current_model) if raw_current_model else None
+    # model 优先级：CLI/UI 显式指定 > config.toml 旧格式 > 不改（留空）
+    if model_override:
+        current_model = model_override
+    else:
+        current_model = parse_current_model(read_text(paths.config_path))
 
     backup_started_at = time.monotonic()
     backup_path = make_backup(paths, "pre-sync")
@@ -852,20 +903,26 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("status", help="Show current provider/thread status")
-    subparsers.add_parser("sync", help="Move all thread providers to the current provider")
+    status_parser = subparsers.add_parser("status", help="Show current provider/thread status")
+    status_parser.add_argument("--provider", help="Override current model_provider for display")
+    status_parser.add_argument("--model", help="Override current model for display")
+    sync_parser = subparsers.add_parser("sync", help="Move all thread providers to the current provider")
+    sync_parser.add_argument("--provider", help="Target provider name to sync all threads to")
+    sync_parser.add_argument("--model", help="Target model name to sync all threads to (omit to keep original)")
     restore_parser = subparsers.add_parser("restore", help="Restore from a backup")
     restore_parser.add_argument("--backup", help="Backup file path; newest backup is used when omitted")
     subparsers.add_parser("backup", help="Create a manual backup")
 
     args = parser.parse_args()
     paths = resolve_paths(args.codex_home)
+    provider_override = getattr(args, "provider", None)
+    model_override = getattr(args, "model", None)
 
     try:
         if args.command == "status":
-            payload = get_status(paths)
+            payload = get_status(paths, provider_override=provider_override, model_override=model_override)
         elif args.command == "sync":
-            payload = sync_to_current_provider(paths)
+            payload = sync_to_current_provider(paths, provider_override=provider_override, model_override=model_override)
         elif args.command == "restore":
             payload = restore_backup(paths, args.backup)
         elif args.command == "backup":
