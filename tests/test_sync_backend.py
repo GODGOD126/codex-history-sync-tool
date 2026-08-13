@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 
-from sync_backend import get_status, make_backup, resolve_paths, restore_backup, sync_to_current_provider
+from sync_backend import (
+    get_status,
+    make_backup,
+    replace_file_with_retry,
+    resolve_paths,
+    restore_backup,
+    sync_to_current_provider,
+)
 
 
 def write_config(
@@ -76,6 +85,41 @@ def write_session_file(codex_home: Path, thread_id: str, provider: str, model: s
 
 
 class SyncBackendTests(unittest.TestCase):
+    def test_replace_file_with_retry_retries_busy_error_on_unix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.tmp"
+            target = Path(temp_dir) / "target.txt"
+            source.write_text("content", encoding="utf-8")
+            target.write_text("old", encoding="utf-8")
+            original_replace = Path.replace
+
+            def flaky_replace(path: Path, destination: Path) -> None:
+                attempts = getattr(flaky_replace, "attempts", 0) + 1
+                flaky_replace.attempts = attempts
+                if attempts <= 2:
+                    raise OSError(errno.EBUSY, "Resource busy")
+                original_replace(path, destination)
+
+            with mock.patch.object(Path, "replace", flaky_replace):
+                replace_file_with_retry(source, target)
+
+            self.assertEqual(flaky_replace.attempts, 3)
+            self.assertEqual(target.read_text(encoding="utf-8"), "content")
+
+    def test_replace_file_with_retry_reraises_unrelated_os_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.tmp"
+            target = Path(temp_dir) / "target.txt"
+            source.write_text("content", encoding="utf-8")
+
+            with mock.patch.object(
+                Path,
+                "replace",
+                mock.Mock(side_effect=OSError(errno.ENOENT, "No such file")),
+            ):
+                with self.assertRaises(OSError):
+                    replace_file_with_retry(source, target)
+
     def test_sync_updates_provider_and_model_for_newer_codex_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             codex_home = Path(temp_dir)

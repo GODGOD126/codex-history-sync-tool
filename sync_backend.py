@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import re
 import sqlite3
@@ -89,6 +90,17 @@ def read_text_exact(path: Path) -> str:
         return handle.read()
 
 
+def is_busy_os_error(exc: OSError) -> bool:
+    """Whether an OSError indicates the target file is temporarily busy/locked.
+
+    Windows 用 winerror 5/32 表示独占访问冲突，macOS/Linux 用 errno
+    (EBUSY/EACCES/EPERM) 表示类似情况，这里统一识别以便跨平台重试。
+    """
+    if getattr(exc, "winerror", None) in (5, 32):
+        return True
+    return exc.errno in (errno.EBUSY, errno.EACCES, errno.EPERM)
+
+
 def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
     last_error: OSError | None = None
     for attempt in range(FILE_REPLACE_RETRY_LIMIT):
@@ -96,10 +108,8 @@ def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
             # 用原子替换避免写到一半被 Codex 读到半成品文件。
             source_path.replace(target_path)
             return
-        except PermissionError as exc:
-            last_error = exc
         except OSError as exc:
-            if getattr(exc, "winerror", None) not in (5, 32):
+            if not is_busy_os_error(exc):
                 raise
             last_error = exc
 
