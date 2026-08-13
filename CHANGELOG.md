@@ -2,6 +2,22 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [1.1.0] - 2026-08-13
+
+macOS 版本。
+
+### 新增
+
+- 新增 macOS 图形界面 `launch_ui.py` 和可双击启动的 `launch_ui.command`，功能对齐 Windows 版（状态查看、一键同步、备份/恢复、打开备份目录、桌面入口）。
+- `launch_ui.command` 会自动检测并优先选择能正常初始化 Tk 的 Python，规避系统自带 Tk 8.5 在新版 macOS 上的兼容问题。
+- 后端文件替换重试逻辑兼容 macOS/Linux 的 `errno`（EBUSY/EACCES/EPERM），不再只识别 Windows 独占锁错误。
+- 为跨平台文件替换重试补充单元测试。
+- README 改为 macOS 优先，并保留 Windows 版说明。
+
+### 兼容性
+
+- 后端本身保持跨平台，Windows 版 `launch_ui.ps1` 与 `py -3` 命令行用法不变。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。
